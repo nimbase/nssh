@@ -54,6 +54,8 @@ type
     macOffer*: seq[string]
     ephLocal*: X25519KeyPair
     ephPeer*: array[32, byte]
+    dhPriv*: seq[byte]       ## our DH private (group14), generated at init
+    dhPeer*: seq[byte]       ## peer's e/f mpint payload as received
     hostKey*: EdKeyPair      ## server signing key
     hasHostKey*: bool
     autoTrust*: bool         ## client: accept unknown host keys (tests)
@@ -77,22 +79,28 @@ proc initClient*(autoTrust = false): SshSession =
   result.role = rClient
   result.stage = stVersion
   result.vLocal = SshVersion
-  result.kexOffer = @[KexCurve25519Sha256]
+  result.kexOffer = @[KexCurve25519Sha256, KexGroup14Sha256]
   result.hostKeyOffer = @[HostKeyEd25519]
-  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr]
-  result.macOffer = @[$mkHmacSha256, $mkHmacSha512]
+  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr,
+                         $ckAes128Gcm, $ckAes256Gcm]
+  result.macOffer = @[$mkHmacSha256, $mkHmacSha512,
+                      $mkHmacSha256Etm, $mkHmacSha512Etm]
   result.ephLocal = x25519GenKey()
+  result.dhPriv = dhPrivate()
   result.autoTrust = autoTrust
 
 proc initServer*(hostKey: EdKeyPair): SshSession =
   result.role = rServer
   result.stage = stVersion
   result.vLocal = SshVersion
-  result.kexOffer = @[KexCurve25519Sha256]
+  result.kexOffer = @[KexCurve25519Sha256, KexGroup14Sha256]
   result.hostKeyOffer = @[HostKeyEd25519]
-  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr]
-  result.macOffer = @[$mkHmacSha256, $mkHmacSha512]
+  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr,
+                         $ckAes128Gcm, $ckAes256Gcm]
+  result.macOffer = @[$mkHmacSha256, $mkHmacSha512,
+                      $mkHmacSha256Etm, $mkHmacSha512Etm]
   result.ephLocal = x25519GenKey()
+  result.dhPriv = dhPrivate()
   result.hostKey = hostKey
   result.hasHostKey = true
 
@@ -170,14 +178,31 @@ proc parseMacKind(s: string): MacKind =
 
 proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
   ## BPP-encode (+ encrypt/MAC when active), queue wire bytes, bump seqno.
+  ## Raises instead of wrapping the sequence number (rekey before 2^32).
+  if s.sendSeq == high(uint32):
+    raise newException(SshSessionError, "ssh session: sequence rollover, rekey first")
   let spec = specFor(s.cipherKind)
   if not s.sendActive:
     s.outbox.add(encodePacket(payload, 8))
   elif s.cipherKind == ckAes128Ctr or s.cipherKind == ckAes256Ctr:
-    let enc = encodePacket(payload, spec.blockSize)
-    let ct = s.keys.toPeer.cipher.ctrCrypt(enc)
-    let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq, enc)
-    s.outbox.add(ct & m)
+    if isEtm(s.keys.toPeer.mac):
+      # ETM: packet_length travels in clear (OpenSSH packet.c `aadlen`),
+      # so packlen itself must be block-aligned; only the rest is CTR
+      # encrypted with the running counter (length consumes no keystream).
+      let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
+      let ctRest = s.keys.toPeer.cipher.ctrCrypt(enc.toOpenArray(4, enc.high))
+      var wire = newSeq[byte](4 + ctRest.len)
+      copyMem(addr wire[0], unsafeAddr enc[0], 4)
+      copyMem(addr wire[4], unsafeAddr ctRest[0], ctRest.len)
+      let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
+        wire.toOpenArray(0, wire.high))
+      s.outbox.add(wire & m)
+    else:
+      let enc = encodePacket(payload, spec.blockSize)
+      let ct = s.keys.toPeer.cipher.ctrCrypt(enc)
+      let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
+        enc.toOpenArray(0, enc.high))
+      s.outbox.add(ct & m)
   elif s.cipherKind == ckAes128Gcm or s.cipherKind == ckAes256Gcm:
     let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
     var plen: array[4, byte]
@@ -223,6 +248,17 @@ proc sendIgnore*(s: var SshSession, data = "nssh") =
   w.writeString(data)
   s.sendPayload(w.toBytes())
 
+proc sendDisconnect*(s: var SshSession, reason: uint32, message: string) =
+  ## Queue a DISCONNECT and mark the session closed for sending. The
+  ## connection owner should flush the outbox then close TCP.
+  var w = initWriter()
+  w.writeByte(MsgDisconnect)
+  w.writeUint32(reason)
+  w.writeString(message)
+  w.writeString("")
+  s.sendPayload(w.toBytes())
+  s.stage = stClosed
+
 # ── receive path ────────────────────────────────────────────────────────────
 
 proc consume(s: var SshSession, n: int) =
@@ -238,104 +274,136 @@ proc payloadOf(packet: openArray[byte]): seq[byte] =
   let padL = int(packet[4])
   result = packet.toOpenArray(5, 3 + plen - padL).toSeq()
 
-proc pullPlaintext(s: var SshSession): seq[seq[byte]] =
-  result = @[]
-  while true:
-    let (found, payload, consumed) = tryDecodePacket(s.inBuf, 8)
-    if not found:
-      break
-    result.add(payload)
-    s.consume(consumed)
-    inc s.recvSeq
+proc pullPlaintextOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
+  ## Decode at most ONE packet; the caller handles it (possibly flipping
+  ## cipher state via NEWKEYS) before the next pull. Pipelined
+  ## NEWKEYS+ciphertext in one TCP chunk requires this one-at-a-time flow.
+  let (found, payload, consumed) = tryDecodePacket(s.inBuf, 8)
+  if not found:
+    return (false, @[])
+  s.consume(consumed)
+  inc s.recvSeq
+  result = (true, payload)
 
-proc pullCtr(s: var SshSession): seq[seq[byte]] =
+proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   ## Peek length with a counter copy; only advance real state on full packets.
-  result = @[]
   let macL = macLen(s.keys.fromPeer.mac)
-  while true:
-    if s.inBuf.len < 16:
-      break
-    var probe = s.keys.fromPeer.cipher
-    let blk = probe.ctrCrypt(s.inBuf.toOpenArray(0, 15))
-    let packetLen = (uint32(blk[0]) shl 24) or (uint32(blk[1]) shl 16) or
-                    (uint32(blk[2]) shl 8) or uint32(blk[3])
-    if packetLen < 12 or packetLen > uint32(MaxSshPacketLen):
-      raise newException(SshSessionError, "ssh session: bad CTR packet_length")
-    let total = 4 + int(packetLen) + macL
-    if s.inBuf.len < total:
-      break
-    let enc = s.keys.fromPeer.cipher.ctrCrypt(s.inBuf.toOpenArray(0, total - macL - 1))
-    let ok =
-      if isEtm(s.keys.fromPeer.mac):
-        verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
-          s.inBuf.toOpenArray(0, total - macL - 1),
-          s.inBuf.toOpenArray(total - macL, total - 1))
-      else:
-        verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq, enc,
-          s.inBuf.toOpenArray(total - macL, total - 1))
-    if not ok:
-      raise newException(SshSessionError, "ssh session: MAC verification failed")
-    result.add(payloadOf(enc))
-    s.consume(total)
-    inc s.recvSeq
-
-proc pullGcm(s: var SshSession): seq[seq[byte]] =
-  result = @[]
-  while true:
+  if isEtm(s.keys.fromPeer.mac):
+    # ETM: packet_length travels in clear (OpenSSH packet.c `aadlen`), so
+    # no probe decrypt is needed; the running counter covers only the
+    # bytes after the length field.
     if s.inBuf.len < 4:
-      break
+      return (false, @[])
     let packetLen = (uint32(s.inBuf[0]) shl 24) or (uint32(s.inBuf[1]) shl 16) or
                     (uint32(s.inBuf[2]) shl 8) or uint32(s.inBuf[3])
-    if packetLen < 5 or packetLen > uint32(MaxSshPacketLen):
-      raise newException(SshSessionError, "ssh session: bad GCM packet_length")
-    let total = 4 + int(packetLen) + GcmTagLen
+    if packetLen < 12 or packetLen > uint32(MaxSshPacketLen):
+      raise newException(SshSessionError, "ssh session: bad CTR packet_length")
+    if int(packetLen) mod specFor(s.cipherKind).blockSize != 0:
+      raise newException(SshSessionError, "ssh session: CTR packet not block aligned")
+    let total = 4 + int(packetLen) + macL
     if s.inBuf.len < total:
-      break
-    var plen: array[4, byte]
-    for i in 0 ..< 4: plen[i] = s.inBuf[i]
-    let pt = s.keys.fromPeer.cipher.gcmOpenPacket(plen,
-      s.inBuf.toOpenArray(4, 4 + int(packetLen) - 1),
-      s.inBuf.toOpenArray(4 + int(packetLen), total - 1))
-    let padL = int(pt[0])
-    result.add(pt.toOpenArray(1, pt.len - padL - 1).toSeq())
+      return (false, @[])
+    let ok = verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
+      s.inBuf.toOpenArray(0, total - macL - 1),
+      s.inBuf.toOpenArray(total - macL, total - 1))
+    if not ok:
+      raise newException(SshSessionError, "ssh session: MAC verification failed")
+    let dec = s.keys.fromPeer.cipher.ctrCrypt(s.inBuf.toOpenArray(4, total - macL - 1))
+    var full = newSeq[byte](4 + dec.len)
+    copyMem(addr full[0], addr s.inBuf[0], 4)
+    copyMem(addr full[4], unsafeAddr dec[0], dec.len)
+    let payload = payloadOf(full)
     s.consume(total)
     inc s.recvSeq
+    return (true, payload)
+  if s.inBuf.len < 16:
+    return (false, @[])
+  var probe = s.keys.fromPeer.cipher
+  let blk = probe.ctrCrypt(s.inBuf.toOpenArray(0, 15))
+  let packetLen = (uint32(blk[0]) shl 24) or (uint32(blk[1]) shl 16) or
+                  (uint32(blk[2]) shl 8) or uint32(blk[3])
+  if packetLen < 12 or packetLen > uint32(MaxSshPacketLen):
+    raise newException(SshSessionError, "ssh session: bad CTR packet_length")
+  # Length is inside the encrypted region: whole packet must be block
+  # aligned (mirrors OpenSSH's `need % block_size` rejection).
+  if (4 + int(packetLen)) mod specFor(s.cipherKind).blockSize != 0:
+    raise newException(SshSessionError, "ssh session: CTR packet not block aligned")
+  let total = 4 + int(packetLen) + macL
+  if s.inBuf.len < total:
+    return (false, @[])
+  let enc = s.keys.fromPeer.cipher.ctrCrypt(s.inBuf.toOpenArray(0, total - macL - 1))
+  let ok =
+    if isEtm(s.keys.fromPeer.mac):
+      verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
+        s.inBuf.toOpenArray(0, total - macL - 1),
+        s.inBuf.toOpenArray(total - macL, total - 1))
+    else:
+      verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq, enc,
+        s.inBuf.toOpenArray(total - macL, total - 1))
+  if not ok:
+    raise newException(SshSessionError, "ssh session: MAC verification failed")
+  let payload = payloadOf(enc)
+  s.consume(total)
+  inc s.recvSeq
+  result = (true, payload)
 
-proc pullChacha(s: var SshSession): seq[seq[byte]] =
-  result = @[]
-  while true:
-    if s.inBuf.len < 4:
-      break
-    var encLen: array[4, byte]
-    for i in 0 ..< 4: encLen[i] = s.inBuf[i]
-    let plen = s.keys.fromPeer.cipher.chachaOpenLength(s.recvSeq, encLen)
-    let packetLen = (uint32(plen[0]) shl 24) or (uint32(plen[1]) shl 16) or
-                    (uint32(plen[2]) shl 8) or uint32(plen[3])
-    # AEAD minimum is 1+4 (OpenSSH packet.c `packlen < 1 + 4`); small packets
-    # like USERAUTH_SUCCESS (packlen 8) are legal — unlike CTR, the length
-    # field is not inside an encrypted cipher block.
-    if packetLen < 5 or packetLen > uint32(MaxSshPacketLen):
-      raise newException(SshSessionError, "ssh session: bad chacha packet_length")
-    let total = 4 + int(packetLen) + ChaTagLen
-    if s.inBuf.len < total:
-      break
-    let pt = s.keys.fromPeer.cipher.chachaOpenAndVerify(s.recvSeq, encLen,
-      s.inBuf.toOpenArray(4, 4 + int(packetLen) - 1),
-      s.inBuf.toOpenArray(4 + int(packetLen), total - 1))
-    let padL = int(pt[0])
-    result.add(pt.toOpenArray(1, pt.len - padL - 1).toSeq())
-    s.consume(total)
-    inc s.recvSeq
+proc pullGcmOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
+  if s.inBuf.len < 4:
+    return (false, @[])
+  let packetLen = (uint32(s.inBuf[0]) shl 24) or (uint32(s.inBuf[1]) shl 16) or
+                  (uint32(s.inBuf[2]) shl 8) or uint32(s.inBuf[3])
+  if packetLen < 5 or packetLen > uint32(MaxSshPacketLen):
+    raise newException(SshSessionError, "ssh session: bad GCM packet_length")
+  let total = 4 + int(packetLen) + GcmTagLen
+  if s.inBuf.len < total:
+    return (false, @[])
+  var plen: array[4, byte]
+  for i in 0 ..< 4: plen[i] = s.inBuf[i]
+  let pt = s.keys.fromPeer.cipher.gcmOpenPacket(plen,
+    s.inBuf.toOpenArray(4, 4 + int(packetLen) - 1),
+    s.inBuf.toOpenArray(4 + int(packetLen), total - 1))
+  let padL = int(pt[0])
+  let payload = pt.toOpenArray(1, pt.len - padL - 1).toSeq()
+  s.consume(total)
+  inc s.recvSeq
+  result = (true, payload)
 
-proc pullPackets(s: var SshSession): seq[seq[byte]] =
+proc pullChachaOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
+  if s.inBuf.len < 4:
+    return (false, @[])
+  var encLen: array[4, byte]
+  for i in 0 ..< 4: encLen[i] = s.inBuf[i]
+  let plen = s.keys.fromPeer.cipher.chachaOpenLength(s.recvSeq, encLen)
+  let packetLen = (uint32(plen[0]) shl 24) or (uint32(plen[1]) shl 16) or
+                  (uint32(plen[2]) shl 8) or uint32(plen[3])
+  # AEAD minimum is 1+4 (OpenSSH packet.c `packlen < 1 + 4`); small packets
+  # like USERAUTH_SUCCESS (packlen 8) are legal — unlike CTR, the length
+  # field is not inside an encrypted cipher block.
+  if packetLen < 5 or packetLen > uint32(MaxSshPacketLen):
+    raise newException(SshSessionError, "ssh session: bad chacha packet_length")
+  let total = 4 + int(packetLen) + ChaTagLen
+  if s.inBuf.len < total:
+    return (false, @[])
+  let pt = s.keys.fromPeer.cipher.chachaOpenAndVerify(s.recvSeq, encLen,
+    s.inBuf.toOpenArray(4, 4 + int(packetLen) - 1),
+    s.inBuf.toOpenArray(4 + int(packetLen), total - 1))
+  let padL = int(pt[0])
+  let payload = pt.toOpenArray(1, pt.len - padL - 1).toSeq()
+  s.consume(total)
+  inc s.recvSeq
+  result = (true, payload)
+
+proc pullOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
+  ## Single packet under the CURRENT cipher state. The caller must handle
+  ## it before pulling again: NEWKEYS flips recvActive mid-buffer.
   if not s.recvActive:
-    result = s.pullPlaintext()
+    result = s.pullPlaintextOne()
   elif s.cipherKind == ckAes128Ctr or s.cipherKind == ckAes256Ctr:
-    result = s.pullCtr()
+    result = s.pullCtrOne()
   elif s.cipherKind == ckAes128Gcm or s.cipherKind == ckAes256Gcm:
-    result = s.pullGcm()
+    result = s.pullGcmOne()
   else:
-    result = s.pullChacha()
+    result = s.pullChachaOne()
 
 # ── KEXDH ───────────────────────────────────────────────────────────────────
 
@@ -360,58 +428,90 @@ proc sendNewKeys(s: var SshSession) =
   s.sendActive = true
 
 proc handleKexDhInit(s: var SshSession, payload: openArray[byte]) =
-  ## Server side: peer epub -> H, sign, reply + NEWKEYS.
+  ## Server side: peer key -> H, sign, reply + NEWKEYS. Branches on kex.
   if not s.hasHostKey:
     raise newException(SshSessionError, "ssh session: server has no host key")
-  var r = initReader(payload)
-  discard r.readByte()
-  let qC = r.readString()
-  if qC.len != 32 or not r.isExhausted():
-    raise newException(SshSessionError, "ssh session: bad KEXDH_INIT")
-  copyMem(addr s.ephPeer[0], unsafeAddr qC[0], 32)
   let (vC, vS, initC, initS) = kexRoles(s)
-  let shared = x25519SharedMpint(s.ephLocal.priv, s.ephPeer)
   let ksBlob = encodePubBlob(s.hostKey.pubkey)
-  let H = curve25519ExchangeHash(vC, vS, initC, initS, ksBlob,
-    s.ephPeer, s.ephLocal.pub, shared)
-  s.K = shared
-  s.H = H
-  s.activateKeys()
-  let sig = edSign(s.hostKey, H)
   var w = initWriter()
   w.writeByte(MsgKexDhReply)
   w.writeString(ksBlob)
-  w.writeString(s.ephLocal.pub)
+  if s.kexName == KexGroup14Sha256:
+    var r = initReader(payload)
+    discard r.readByte()
+    let eRaw = r.readMpint()
+    if not r.isExhausted():
+      raise newException(SshSessionError, "ssh session: bad KEXDH_INIT")
+    let prime = group14Prime()
+    let e = mpintToUnsigned(eRaw)
+    let shared = dhShared(e, s.dhPriv, prime)
+    let f = dhPublic(s.dhPriv, prime)
+    let H = dhExchangeHash(vC, vS, initC, initS, ksBlob, e, f, shared)
+    s.K = shared
+    s.H = H
+    s.activateKeys()
+    w.writeMpint(f)
+  else:
+    var r = initReader(payload)
+    discard r.readByte()
+    let qC = r.readString()
+    if qC.len != 32 or not r.isExhausted():
+      raise newException(SshSessionError, "ssh session: bad KEXDH_INIT")
+    copyMem(addr s.ephPeer[0], unsafeAddr qC[0], 32)
+    let shared = x25519SharedMpint(s.ephLocal.priv, s.ephPeer)
+    let H = curve25519ExchangeHash(vC, vS, initC, initS, ksBlob,
+      s.ephPeer, s.ephLocal.pub, shared)
+    s.K = shared
+    s.H = H
+    s.activateKeys()
+    w.writeString(s.ephLocal.pub)
+  let sig = edSign(s.hostKey, s.H)
   w.writeString(encodeSignature(sig))
   s.sendPayload(w.toBytes())
   s.sendNewKeys()
   s.stage = stNewKeys
 
 proc handleKexDhReply(s: var SshSession, payload: openArray[byte]) =
-  ## Client side: verify hostkey + signature, send NEWKEYS.
+  ## Client side: verify hostkey + signature, send NEWKEYS. Branches on kex.
   var r = initReader(payload)
   if r.readByte() != MsgKexDhReply:
     raise newException(SshSessionError, "ssh session: not a KEXDH_REPLY")
   let ksBlob = r.readString()
-  let qS = r.readString()
-  let sigBlob = r.readString()
-  if not r.isExhausted():
-    raise newException(SshSessionError, "ssh session: KEXDH_REPLY trailing bytes")
-  if qS.len != 32:
-    raise newException(SshSessionError, "ssh session: bad server epub length")
   let pub = parsePubBlob(ksBlob)
   if not s.autoTrust:
     raise newException(SshSessionError, "ssh session: untrusted host key")
-  copyMem(addr s.ephPeer[0], unsafeAddr qS[0], 32)
   let (vC, vS, initC, initS) = kexRoles(s)
-  let shared = x25519SharedMpint(s.ephLocal.priv, s.ephPeer)
-  let H = curve25519ExchangeHash(vC, vS, initC, initS, ksBlob,
-    s.ephLocal.pub, s.ephPeer, shared)
-  let sig = parseSignature(sigBlob)
-  if not edVerify(pub, H, sig):
-    raise newException(SshSessionError, "ssh session: host signature invalid")
-  s.K = shared
-  s.H = H
+  if s.kexName == KexGroup14Sha256:
+    let fRaw = r.readMpint()
+    let sigBlob = r.readString()
+    if not r.isExhausted():
+      raise newException(SshSessionError, "ssh session: KEXDH_REPLY trailing bytes")
+    let prime = group14Prime()
+    let f = mpintToUnsigned(fRaw)
+    let shared = dhShared(f, s.dhPriv, prime)
+    let e = dhPublic(s.dhPriv, prime)
+    let H = dhExchangeHash(vC, vS, initC, initS, ksBlob, e, f, shared)
+    let sig = parseSignature(sigBlob)
+    if not edVerify(pub, H, sig):
+      raise newException(SshSessionError, "ssh session: host signature invalid")
+    s.K = shared
+    s.H = H
+  else:
+    let qS = r.readString()
+    let sigBlob = r.readString()
+    if not r.isExhausted():
+      raise newException(SshSessionError, "ssh session: KEXDH_REPLY trailing bytes")
+    if qS.len != 32:
+      raise newException(SshSessionError, "ssh session: bad server epub length")
+    copyMem(addr s.ephPeer[0], unsafeAddr qS[0], 32)
+    let shared = x25519SharedMpint(s.ephLocal.priv, s.ephPeer)
+    let H = curve25519ExchangeHash(vC, vS, initC, initS, ksBlob,
+      s.ephLocal.pub, s.ephPeer, shared)
+    let sig = parseSignature(sigBlob)
+    if not edVerify(pub, H, sig):
+      raise newException(SshSessionError, "ssh session: host signature invalid")
+    s.K = shared
+    s.H = H
   s.activateKeys()
   s.sendNewKeys()
   s.stage = stNewKeys
@@ -435,7 +535,7 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
       if s.role == rClient: (loc, peer) else: (peer, loc)
     s.kexName = pickFirst(cLists[0], svLists[0])
     s.hostKeyName = pickFirst(cLists[1], svLists[1])
-    if s.kexName != KexCurve25519Sha256:
+    if s.kexName != KexCurve25519Sha256 and s.kexName != KexGroup14Sha256:
       raise newException(SshSessionError, "ssh session: unsupported kex " & s.kexName)
     if s.hostKeyName != HostKeyEd25519:
       raise newException(SshSessionError, "ssh session: unsupported hostkey")
@@ -452,7 +552,10 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
     if s.role == rClient:
       var w = initWriter()
       w.writeByte(MsgKexDhInit)
-      w.writeString(s.ephLocal.pub)
+      if s.kexName == KexGroup14Sha256:
+        w.writeMpint(dhPublic(s.dhPriv, group14Prime()))
+      else:
+        w.writeString(s.ephLocal.pub)
       s.sendPayload(w.toBytes())
     s.stage = stKexDh
   of MsgKexDhInit:
@@ -471,8 +574,18 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
       s.stage = stOpen
       result.add(SessionEvent(kind: evReady))
   of MsgDisconnect:
+    var reason = 0'u32
+    var text = "peer disconnected"
+    try:
+      var r = initReader(payload)
+      discard r.readByte()
+      reason = r.readUint32()
+      text = r.readStringStr()
+    except SshCodecError:
+      discard
     s.stage = stClosed
-    result.add(SessionEvent(kind: evDisconnect, message: "peer disconnected"))
+    result.add(SessionEvent(kind: evDisconnect,
+      message: "peer disconnected (" & $reason & "): " & text))
   else:
     if s.stage == stOpen:
       result.add(SessionEvent(kind: evPacket, msgType: payload[0],
@@ -483,8 +596,16 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
 proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent] =
   ## Feed inbound bytes (version lines + packets). Returns session events.
   ## Peer-triggered failures become evErrorMsg events, never exceptions.
+  ## The reassembly buffer is capped: a peer that never completes a line
+  ## or packet is cut off instead of growing memory without bound.
+  const MaxSessionBuffer = 262144
   result = @[]
   if chunk.len > 0:
+    if s.inBuf.len + chunk.len > MaxSessionBuffer:
+      s.stage = stClosed
+      result.add(SessionEvent(kind: evErrorMsg,
+        message: "ssh session: inbound buffer overflow"))
+      return
     let off = s.inBuf.len
     s.inBuf.setLen(off + chunk.len)
     copyMem(addr s.inBuf[off], unsafeAddr chunk[0], chunk.len)
@@ -502,7 +623,10 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
       return
     s.stage = stKexInit
   try:
-    for p in s.pullPackets():
+    while true:
+      let (found, p) = s.pullOne()
+      if not found:
+        break
       for ev in s.handleMessage(p):
         result.add(ev)
   except ValueError as e:

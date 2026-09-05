@@ -49,8 +49,8 @@ type
       ctr*: array[16, byte] ## running counter block (CTR) / unused (none)
     of true:
       gcmKey*: seq[byte]
-      gcmFixed*: array[4, byte] ## GCM nonce salt; unused for chacha
-      gcmCounter*: uint64       ## GCM invocation counter; unused for chacha
+      gcmNonce*: array[12, byte] ## GCM running nonce: starts at the full
+        ## KEX-derived IV, +1 per packet (OpenSSH cipher.c); unused for chacha
       chaK1*: array[32, byte]   ## chacha LENGTH key (key[32..64]); zeroed for GCM
       chaK2*: array[32, byte]   ## chacha PAYLOAD key (key[0..32]); zeroed for GCM
 
@@ -100,8 +100,9 @@ proc initCipher*(kind: CipherKind, key, iv: openArray[byte]): SshCipher =
   of ckAes128Gcm, ckAes256Gcm:
     result = SshCipher(kind: kind, isAeadCipher: true)
     result.gcmKey = key.toSeq()
-    copyMem(addr result.gcmFixed[0], unsafeAddr iv[0], 4)
-    result.gcmCounter = 0
+    if iv.len != GcmNonceLen:
+      raise newException(SshCipherError, "ssh cipher: GCM needs a 12-byte IV")
+    copyMem(addr result.gcmNonce[0], unsafeAddr iv[0], GcmNonceLen)
   of ckChacha20Poly1305:
     result = SshCipher(kind: kind, isAeadCipher: true)
     # Layout matches OpenSSH cipher-chachapoly.c chachapoly_new():
@@ -129,10 +130,15 @@ proc ctrCrypt*(c: var SshCipher, data: openArray[byte]): seq[byte] =
 
 # ── AES-GCM (RFC 5647: clear length as AAD, 4B salt + u64 counter nonce) ────
 
-proc gcmNonce(c: SshCipher): array[12, byte] =
-  copyMem(addr result[0], unsafeAddr c.gcmFixed[0], 4)
-  for i in 0 ..< 8:
-    result[4 + i] = byte(c.gcmCounter shr (56 - 8 * i))
+proc incGcmNonce(c: var SshCipher) =
+  ## +1 over the 12-byte nonce, big-endian (matches OpenSSH increment).
+  var carry: uint16 = 1
+  for i in countdown(11, 0):
+    let s = uint16(c.gcmNonce[i]) + carry
+    c.gcmNonce[i] = byte(s and 0xFF)
+    carry = s shr 8
+    if carry == 0:
+      break
 
 proc gcmSealPacket*(c: var SshCipher, packetLen: array[4, byte],
                     plaintext: openArray[byte]): tuple[ct: seq[byte], tag: array[16, byte]] =
@@ -140,9 +146,8 @@ proc gcmSealPacket*(c: var SshCipher, packetLen: array[4, byte],
   ## Length field travels in clear as AAD; returns ciphertext + 16B tag.
   if c.kind != ckAes128Gcm and c.kind != ckAes256Gcm:
     raise newException(SshCipherError, "ssh cipher: not a GCM cipher")
-  let nonce = gcmNonce(c)
-  let (ct, tag) = gcmAlgo.gcmLock(c.gcmKey, nonce, plaintext, packetLen)
-  inc c.gcmCounter
+  let (ct, tag) = gcmAlgo.gcmLock(c.gcmKey, c.gcmNonce, plaintext, packetLen)
+  incGcmNonce(c)
   var t: array[16, byte]
   copyMem(addr t[0], unsafeAddr tag[0], 16)
   result = (ct, t)
@@ -153,11 +158,10 @@ proc gcmOpenPacket*(c: var SshCipher, packetLen: array[4, byte],
     raise newException(SshCipherError, "ssh cipher: not a GCM cipher")
   if tag.len != 16:
     raise newException(SshCipherError, "ssh cipher: bad GCM tag length")
-  let nonce = gcmNonce(c)
-  let plain = gcmAlgo.gcmUnlock(c.gcmKey, nonce, ct, tag, packetLen)
+  let plain = gcmAlgo.gcmUnlock(c.gcmKey, c.gcmNonce, ct, tag, packetLen)
   if plain.isNone:
     raise newException(SshCipherError, "ssh cipher: GCM tag verification failed")
-  inc c.gcmCounter
+  incGcmNonce(c)
   result = plain.get()
 
 # ── chacha20-poly1305@openssh.com ───────────────────────────────────────────
@@ -290,8 +294,8 @@ proc newDirectionKeys*(K: openArray[byte], H: array[32, byte],
              deriveKey(K, H, sid, macLetter, macLen(macKind))
            else: @[]
   result = DirectionKeys(cipher: initCipher(cipherKind, ck, iv),
-                         mac: if cspec.isAead: mkNone else: macKind,
-                         macKey: mk)
+                          mac: if cspec.isAead: mkNone else: macKind,
+                          macKey: mk)
 
 proc newSessionKeys*(K: openArray[byte], H: array[32, byte],
                      sessionId: openArray[byte], cipherKind: CipherKind,

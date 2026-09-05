@@ -31,12 +31,15 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
            onDisconnect: proc(c: SshClient, msg: string) {.closure.} = nil,
            onError: proc(c: SshClient, msg: string) {.closure.} = nil,
            onClose: proc(c: SshClient) {.closure.} = nil,
-           cipherOffer: seq[string] = @[]): SshClient =
+           cipherOffer: seq[string] = @[],
+           kexOffer: seq[string] = @[]): SshClient =
   result = SshClient(loop: loop, session: initClient(autoTrust),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
   if cipherOffer.len > 0:
     result.session.cipherOffer = cipherOffer
+  if kexOffer.len > 0:
+    result.session.kexOffer = kexOffer
   let cli = result
   loop.connect(address, port,
     onConnect = proc(conn: Connection) =
@@ -77,6 +80,12 @@ proc sendRaw*(cli: SshClient, payload: openArray[byte]) =
   ## Send an upper-layer payload (auth/channel) through the session.
   cli.session.sendPayload(payload)
   flushOutbox(cli.conn, cli.session)
+
+proc sendDisconnect*(cli: SshClient, reason: uint32, message: string) =
+  ## Queue DISCONNECT, flush, and close the TCP connection.
+  cli.session.sendDisconnect(reason, message)
+  flushOutbox(cli.conn, cli.session)
+  cli.conn.close()
 
 proc close*(cli: SshClient) =
   if cli.conn != nil:

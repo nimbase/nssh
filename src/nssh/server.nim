@@ -41,7 +41,8 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
                    onDisconnect: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onError: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onClose: proc(c: ServerConn) {.closure.} = nil,
-                   cipherOffer: seq[string] = @[]): SshServer =
+                   cipherOffer: seq[string] = @[],
+                   kexOffer: seq[string] = @[]): SshServer =
   result = SshServer(loop: loop, hostKey: hostKey, conns: initTable[pointer, ServerConn](),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
@@ -52,6 +53,8 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
       var sc = ServerConn(conn: conn, session: initServer(srv.hostKey))
       if offer.len > 0:
         sc.session.cipherOffer = offer
+      if kexOffer.len > 0:
+        sc.session.kexOffer = kexOffer
       srv.conns[key(conn)] = sc
       sc.session.startHandshake()
       flushOutbox(conn, sc.session)
@@ -95,3 +98,10 @@ proc sendRaw*(srv: SshServer, c: ServerConn, payload: openArray[byte]) =
   ## Send an upper-layer payload (auth/channel) through the session.
   c.session.sendPayload(payload)
   flushOutbox(c.conn, c.session)
+
+proc sendDisconnect*(srv: SshServer, c: ServerConn, reason: uint32,
+                     message: string) =
+  ## Queue DISCONNECT, flush, and close the TCP connection.
+  c.session.sendDisconnect(reason, message)
+  flushOutbox(c.conn, c.session)
+  c.conn.close()

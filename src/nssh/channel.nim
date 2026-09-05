@@ -211,7 +211,8 @@ proc replyRequest(m: var ChannelMux, c: Channel, ok: bool) =
   w.writeUint32(c.remoteId)
   m.outbox.add(w.toBytes())
 
-proc feed*(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
+proc feedInner(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
+  ## Inner dispatch; raises SshChannelError/SshCodecError.
   result = @[]
   if payload.len == 0:
     return
@@ -417,3 +418,10 @@ proc feed*(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
   else:
     raise newException(SshChannelError,
       "ssh channel: unexpected message " & $payload[0])
+
+proc feed*(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
+  ## Feed one inbound payload. Raises only SshChannelError on malformed input.
+  try:
+    result = feedInner(m, payload)
+  except ValueError as e:
+    raise newException(SshChannelError, "ssh channel: " & e.msg)

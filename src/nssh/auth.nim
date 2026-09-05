@@ -221,7 +221,7 @@ proc takeOutbox*(c: var AuthClient): seq[seq[byte]] =
   result = c.outbox
   c.outbox = @[]
 
-proc authFeed*(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
+proc authFeedInner(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
   ## Drive one inbound message. Queues responses; reports terminal states.
   if payload.len == 0:
     return AuthClientEvent(kind: acWaiting)
@@ -271,6 +271,13 @@ proc authFeed*(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
     return AuthClientEvent(kind: acFailed,
       message: "unexpected auth message " & $payload[0])
 
+proc authFeed*(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
+  ## Drive one inbound message. Raises only SshAuthError on malformed input.
+  try:
+    result = authFeedInner(c, payload)
+  except ValueError as e:
+    raise newException(SshAuthError, "ssh auth: " & e.msg)
+
 # ── server ──────────────────────────────────────────────────────────────────
 
 type
@@ -310,7 +317,8 @@ proc failMethods(s: AuthServer): seq[string] =
   if s.checkPassword != nil:
     result.add(MethodPassword)
 
-proc authFeed*(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
+proc authFeedInner(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
+  ## Inner dispatch; raises SshAuthError/SshCodecError/SshKeyError.
   if payload.len == 0:
     return AuthServerEvent(kind: asWaiting)
   case payload[0]
@@ -369,3 +377,10 @@ proc authFeed*(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
       return AuthServerEvent(kind: asAttempt, user: req.user, meth: req.meth)
   else:
     return AuthServerEvent(kind: asAttempt, message: "unexpected message")
+
+proc authFeed*(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
+  ## Drive one inbound message. Raises only SshAuthError on malformed input.
+  try:
+    result = authFeedInner(s, payload)
+  except ValueError as e:
+    raise newException(SshAuthError, "ssh auth: " & e.msg)

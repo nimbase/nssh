@@ -76,7 +76,8 @@ proc encodePacket*(payload: openArray[byte], blockSize = 8,
   ## Encode one plaintext BPP packet. `padding` is caller-supplied random
   ## bytes for deterministic tests; when empty, fresh random padding is used.
   ## `lengthInClear` is for AEAD ciphers (chacha/GCM, RFC 5647, OpenSSH
-  ## packet.c `len -= aadlen`): the 4 length bytes travel unencrypted, so
+  ## packet.c `len -= aadlen`) and for CTR+ETM (OpenSSH sends the length
+  ## in clear as AAD there too): the 4 length bytes travel unencrypted, so
   ## packlen itself (not 4+packlen) must be block-aligned.
   if blockSize < 8:
     raise newException(SshTransportError, "ssh transport: bad block size")
