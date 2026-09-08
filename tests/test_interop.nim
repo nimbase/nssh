@@ -63,9 +63,20 @@ proc routeSrvApp(srv: SshServer, c: ServerConn, app: SrvApp,
     for p in app.mux.takeOutbox():
       srv.sendRaw(c, p)
 
-proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = "") =
+proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = ""): bool =
   ## Full `ssh` exec round trip against our server with forced algorithms.
-  let tmp = getTempDir() / "nssh-interop-a"
+  ## Returns true only when exec observed, exit 0, and stdout matches.
+  ## Must be wrapped in `check` at the call site: `check` inside a helper
+  ## proc does not fail the suite (vacuous OKs).
+  proc sanitize(s: string): string =
+    for ch in s:
+      case ch
+      of 'a'..'z', 'A'..'Z', '0'..'9', '-', '_': result.add(ch)
+      else: result.add('_')
+  let tag = sanitize(kexAlgo) & "-" & sanitize(cipher) &
+    (if mac.len > 0: "-" & sanitize(mac) else: "") &
+    "-" & $getCurrentProcessId()
+  let tmp = getTempDir() / ("nssh-interop-a-" & tag)
   createDir(tmp)
   defer: removeDir(tmp)
   let keyPath = tmp / "id_ed"
@@ -108,54 +119,52 @@ proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = "") =
   if mac.len > 0:
     sshArgs.add(["-o", "MACs=" & mac])
   sshArgs.add(["interop@localhost", "echo hello-interop"])
-  let sshProc = startProcess("ssh", args = sshArgs, options = {poUsePath})
-  var sshOut = ""
-  var sshCode = -1
-  for _ in 0 ..< 1200:
-    loop.poll(25)
-    sshCode = sshProc.peekExitCode()
-    if sshCode != -1:
-      break
-  if sshCode == -1:
-    sshProc.kill()
-    loop.poll(50)
-  sshOut = sshProc.outputStream().readAll()
-  var sshErr = ""
   try:
-    sshErr = sshProc.errorStream().readAll()
-  except ValueError:
-    discard
-  sshCode = sshProc.peekExitCode()
-  sshProc.close()
-  if sawExec != "echo hello-interop" or sshCode != 0 or sshOut != "ok\n":
-    echo "INTEROP DIAG kex=", kexAlgo, " cipher=", cipher, " mac=", mac,
-      " code=", sshCode, " out=", repr(sshOut), " err=", repr(sshErr)
-
-  check sawExec == "echo hello-interop"
-  check sshCode == 0
-  check sshOut == "ok\n"
-
-  srv.close()
-  loop.close()
+    let sshProc = startProcess("ssh", args = sshArgs, options = {poUsePath})
+    var sshOut = ""
+    var sshCode = -1
+    for _ in 0 ..< 1200:
+      loop.poll(25)
+      sshCode = sshProc.peekExitCode()
+      if sshCode != -1:
+        break
+    if sshCode == -1:
+      sshProc.kill()
+      loop.poll(50)
+    sshOut = sshProc.outputStream().readAll()
+    var sshErr = ""
+    try:
+      sshErr = sshProc.errorStream().readAll()
+    except ValueError:
+      discard
+    sshCode = sshProc.peekExitCode()
+    sshProc.close()
+    result = sawExec == "echo hello-interop" and sshCode == 0 and sshOut == "ok\n"
+    if not result:
+      echo "INTEROP DIAG kex=", kexAlgo, " cipher=", cipher, " mac=", mac,
+        " code=", sshCode, " out=", repr(sshOut), " err=", repr(sshErr)
+  finally:
+    srv.close()
+    loop.close()
 
 test "A: openssh client runs exec on our server":
   if not (haveTool("ssh") and haveTool("ssh-keygen")):
     skip()
-  runSshExecOnOurServer("curve25519-sha256", "chacha20-poly1305@openssh.com")
+  check runSshExecOnOurServer("curve25519-sha256", "chacha20-poly1305@openssh.com")
 
 test "A2: openssh client runs exec on our server via group14-sha256":
   if not (haveTool("ssh") and haveTool("ssh-keygen")):
     skip()
-  runSshExecOnOurServer("diffie-hellman-group14-sha256", "aes128-ctr")
+  check runSshExecOnOurServer("diffie-hellman-group14-sha256", "aes128-ctr")
 
 test "A3: cipher matrix (aes256-ctr, gcm, etm)":
   if not (haveTool("ssh") and haveTool("ssh-keygen")):
     skip()
-  runSshExecOnOurServer("curve25519-sha256", "aes256-ctr")
-  runSshExecOnOurServer("curve25519-sha256", "aes128-ctr",
+  check runSshExecOnOurServer("curve25519-sha256", "aes256-ctr")
+  check runSshExecOnOurServer("curve25519-sha256", "aes128-ctr",
     "hmac-sha2-256-etm@openssh.com")
-  runSshExecOnOurServer("curve25519-sha256", "aes128-gcm@openssh.com")
-  runSshExecOnOurServer("curve25519-sha256", "aes256-gcm@openssh.com")
+  check runSshExecOnOurServer("curve25519-sha256", "aes128-gcm@openssh.com")
+  check runSshExecOnOurServer("curve25519-sha256", "aes256-gcm@openssh.com")
 
 test "B: our client runs exec on system sshd":
   if not (haveTool("sshd") and haveTool("ssh-keygen")):
