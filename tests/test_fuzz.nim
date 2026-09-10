@@ -142,14 +142,14 @@ test "auth/channel feeds never raise Defect":
     var a = initAuthServer([0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     try:
-      discard a.authFeed(data)
+      discard a.authFeed(data, 0)
     except SshAuthError:
       discard
     except Defect:
       inc defects
     var m = initMux(true)
     try:
-      discard m.feed(data)
+      discard m.feed(data, 0)
     except SshChannelError:
       discard
     except Defect:

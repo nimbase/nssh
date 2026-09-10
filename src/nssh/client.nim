@@ -19,7 +19,8 @@ type
     session*: SshSession
     connected*: bool
     onReady*: proc(c: SshClient) {.closure.}
-    onPacket*: proc(c: SshClient, msgType: byte, payload: seq[byte]) {.closure.}
+    onPacket*: proc(c: SshClient, msgType: byte, payload: seq[byte],
+                     seqno: uint32) {.closure.}
     onDisconnect*: proc(c: SshClient, msg: string) {.closure.}
     onError*: proc(c: SshClient, msg: string) {.closure.}
     onClose*: proc(c: SshClient) {.closure.}
@@ -27,12 +28,14 @@ type
 proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
            onReady: proc(c: SshClient) {.closure.} = nil,
            onPacket: proc(c: SshClient, msgType: byte,
-                          payload: seq[byte]) {.closure.} = nil,
+                          payload: seq[byte],
+                          seqno: uint32) {.closure.} = nil,
            onDisconnect: proc(c: SshClient, msg: string) {.closure.} = nil,
            onError: proc(c: SshClient, msg: string) {.closure.} = nil,
            onClose: proc(c: SshClient) {.closure.} = nil,
            cipherOffer: seq[string] = @[],
-           kexOffer: seq[string] = @[]): SshClient =
+           kexOffer: seq[string] = @[],
+           macOffer: seq[string] = @[]): SshClient =
   result = SshClient(loop: loop, session: initClient(autoTrust),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
@@ -40,6 +43,8 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
     result.session.cipherOffer = cipherOffer
   if kexOffer.len > 0:
     result.session.kexOffer = kexOffer
+  if macOffer.len > 0:
+    result.session.macOffer = macOffer
   let cli = result
   loop.connect(address, port,
     onConnect = proc(conn: Connection) =
@@ -57,7 +62,7 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
       let onErrCb = cli.onError
       dispatch(events,
         onReady = (if onReadyCb != nil: (proc() {.closure.} = onReadyCb(cli)) else: nil),
-        onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte]) {.closure.} = onPacketCb(cli, m, p)) else: nil),
+        onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte], q: uint32) {.closure.} = onPacketCb(cli, m, p, q)) else: nil),
         onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(cli, m)) else: nil),
         onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(cli, m)) else: nil))
       closeIfDone(conn, cli.session)

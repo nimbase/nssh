@@ -18,10 +18,16 @@ import ./hostkeys
 const
   MsgDisconnect* = 1'u8
   MsgIgnore* = 2'u8
+  MsgUnimplemented* = 3'u8
+  MsgDebug* = 4'u8
   MsgKexInit* = 20'u8
   MsgNewKeys* = 21'u8
   MsgKexDhInit* = 30'u8
   MsgKexDhReply* = 31'u8
+
+  # We do not implement rekeying (modern-only MVP): a peer KEXINIT after
+  # the initial exchange is refused with this reason, not silently dropped.
+  DisconnectKeyExchangeFailed* = 3'u32
 
 type
   SshSessionError* = object of ValueError
@@ -40,6 +46,8 @@ type
     msgType*: byte
     payload*: seq[byte]  ## full BPP payload for evPacket
     message*: string     ## human detail for evDisconnect/evErrorMsg
+    seqno*: uint32       ## inbound packet sequence number (evPacket only);
+      ## lets upper layers answer (e.g. UNIMPLEMENTED) about this packet
 
   SshSession* = object
     role*: Role
@@ -267,6 +275,14 @@ proc consume(s: var SshSession, n: int) =
     copyMem(addr s.inBuf[0], addr s.inBuf[n], left)
   s.inBuf.setLen(left)
 
+proc bumpRecvSeq(s: var SshSession) =
+  ## Advance the inbound sequence number. Raises instead of wrapping
+  ## (rekey before 2^32), mirroring the send-side guard in sendPayload.
+  if s.recvSeq == high(uint32):
+    raise newException(SshSessionError,
+      "ssh session: receive sequence rollover, rekey first")
+  inc s.recvSeq
+
 proc payloadOf(packet: openArray[byte]): seq[byte] =
   ## Strip BPP length/padding, return payload (msg type + data).
   let plen = (int(packet[0]) shl 24) or (int(packet[1]) shl 16) or
@@ -282,7 +298,7 @@ proc pullPlaintextOne(s: var SshSession): tuple[found: bool, payload: seq[byte]]
   if not found:
     return (false, @[])
   s.consume(consumed)
-  inc s.recvSeq
+  s.bumpRecvSeq()
   result = (true, payload)
 
 proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
@@ -314,7 +330,7 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
     copyMem(addr full[4], unsafeAddr dec[0], dec.len)
     let payload = payloadOf(full)
     s.consume(total)
-    inc s.recvSeq
+    s.bumpRecvSeq()
     return (true, payload)
   if s.inBuf.len < 16:
     return (false, @[])
@@ -344,7 +360,7 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
     raise newException(SshSessionError, "ssh session: MAC verification failed")
   let payload = payloadOf(enc)
   s.consume(total)
-  inc s.recvSeq
+  s.bumpRecvSeq()
   result = (true, payload)
 
 proc pullGcmOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
@@ -365,7 +381,7 @@ proc pullGcmOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   let padL = int(pt[0])
   let payload = pt.toOpenArray(1, pt.len - padL - 1).toSeq()
   s.consume(total)
-  inc s.recvSeq
+  s.bumpRecvSeq()
   result = (true, payload)
 
 proc pullChachaOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
@@ -390,7 +406,7 @@ proc pullChachaOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   let padL = int(pt[0])
   let payload = pt.toOpenArray(1, pt.len - padL - 1).toSeq()
   s.consume(total)
-  inc s.recvSeq
+  s.bumpRecvSeq()
   result = (true, payload)
 
 proc pullOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
@@ -524,6 +540,15 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
     raise newException(SshSessionError, "ssh session: empty payload")
   case payload[0]
   of MsgKexInit:
+    if s.stage == stOpen:
+      # MVP has no rekey support: refuse cleanly with DISCONNECT carrying
+      # the reason instead of a bare protocol error, so the peer (and our
+      # logs) show why the connection is going down.
+      s.sendDisconnect(DisconnectKeyExchangeFailed,
+        "ssh session: rekey not supported")
+      result.add(SessionEvent(kind: evDisconnect,
+        message: "ssh session: rekey not supported"))
+      return
     if s.stage != stKexInit:
       raise newException(SshSessionError, "ssh session: unexpected KEXINIT")
     s.iPeer = payload.toSeq()
@@ -627,8 +652,14 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
       let (found, p) = s.pullOne()
       if not found:
         break
-      for ev in s.handleMessage(p):
-        result.add(ev)
+      # pullOne consumed exactly one packet and advanced recvSeq, so the
+      # packet now in handleMessage has this sequence number. Stamp it on
+      # every event so upper layers can reference it (UNIMPLEMENTED).
+      let pseq = s.recvSeq - 1
+      var evs = s.handleMessage(p)
+      for i in 0 ..< evs.len:
+        evs[i].seqno = pseq
+        result.add(evs[i])
   except ValueError as e:
     s.stage = stClosed
     result.add(SessionEvent(kind: evErrorMsg, message: e.msg))

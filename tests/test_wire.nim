@@ -40,7 +40,7 @@ test "tcp loopback handshake + encrypted traffic":
       srvConn = c
       srvSid = @(c.session.sessionId)
     ,
-    onPacket = proc(c: ServerConn, m: byte, p: seq[byte]) =
+    onPacket = proc(c: ServerConn, m: byte, p: seq[byte], q: uint32) =
       if m == MsgIgnore:
         srvGot = ignoreText(p)
     ,
@@ -53,7 +53,7 @@ test "tcp loopback handshake + encrypted traffic":
       cliReady = true
       cliSid = @(c.session.sessionId)
     ,
-    onPacket = proc(c: SshClient, m: byte, p: seq[byte]) =
+    onPacket = proc(c: SshClient, m: byte, p: seq[byte], q: uint32) =
       if m == MsgIgnore:
         cliGot = ignoreText(p)
     ,

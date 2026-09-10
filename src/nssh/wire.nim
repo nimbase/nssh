@@ -13,7 +13,8 @@ proc flushOutbox*(conn: Connection, s: var SshSession) =
 
 proc dispatch*(events: seq[SessionEvent],
                onReady: proc() {.closure.} = nil,
-               onPacket: proc(msgType: byte, payload: seq[byte]) {.closure.} = nil,
+               onPacket: proc(msgType: byte, payload: seq[byte],
+                              seqno: uint32) {.closure.} = nil,
                onDisconnect: proc(msg: string) {.closure.} = nil,
                onError: proc(msg: string) {.closure.} = nil) =
   for ev in events:
@@ -23,7 +24,7 @@ proc dispatch*(events: seq[SessionEvent],
         onReady()
     of evPacket:
       if onPacket != nil:
-        onPacket(ev.msgType, ev.payload)
+        onPacket(ev.msgType, ev.payload, ev.seqno)
     of evDisconnect:
       if onDisconnect != nil:
         onDisconnect(ev.message)

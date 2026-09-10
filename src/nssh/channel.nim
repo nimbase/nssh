@@ -30,6 +30,10 @@ const
   MsgIgnore* = 2'u8
   MsgDebug* = 4'u8
 
+  # Reply for unimplemented packet types (RFC 4253 §11.4). Private: the
+  # sequence number comes from the caller (session stamps evPacket).
+  MsgUnimplemented = 3'u8
+
   OpenAdminProhibited* = 1'u32
   OpenConnectFailed* = 2'u32
   OpenUnknownType* = 3'u32
@@ -211,8 +215,17 @@ proc replyRequest(m: var ChannelMux, c: Channel, ok: bool) =
   w.writeUint32(c.remoteId)
   m.outbox.add(w.toBytes())
 
-proc feedInner(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
-  ## Inner dispatch; raises SshChannelError/SshCodecError.
+proc buildUnimplemented(seqno: uint32): seq[byte] =
+  var w = initWriter()
+  w.writeByte(MsgUnimplemented)
+  w.writeUint32(seqno)
+  result = w.toBytes()
+
+proc feedInner(m: var ChannelMux, payload: openArray[byte],
+               seqno: uint32): seq[ChanEvent] =
+  ## Inner dispatch; raises SshChannelError/SshCodecError. Unknown packet
+  ## types queue UNIMPLEMENTED (with the caller's seqno) before raising, so
+  ## the peer gets its RFC 4253 §11.4 reply via takeOutbox.
   result = @[]
   if payload.len == 0:
     return
@@ -416,12 +429,16 @@ proc feedInner(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
     # Transport keepalives; nothing to do.
     discard
   else:
+    m.outbox.add(buildUnimplemented(seqno))
     raise newException(SshChannelError,
       "ssh channel: unexpected message " & $payload[0])
 
-proc feed*(m: var ChannelMux, payload: openArray[byte]): seq[ChanEvent] =
-  ## Feed one inbound payload. Raises only SshChannelError on malformed input.
+proc feed*(m: var ChannelMux, payload: openArray[byte],
+           seqno: uint32): seq[ChanEvent] =
+  ## Feed one inbound payload. `seqno` is the packet's sequence number
+  ## (session stamps it on evPacket); used for UNIMPLEMENTED replies.
+  ## Raises only SshChannelError on malformed input.
   try:
-    result = feedInner(m, payload)
+    result = feedInner(m, payload, seqno)
   except ValueError as e:
     raise newException(SshChannelError, "ssh channel: " & e.msg)

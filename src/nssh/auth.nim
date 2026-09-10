@@ -24,6 +24,23 @@ const
   MethodPublickey* = "publickey"
   MethodPassword* = "password"
 
+const
+  # Transport keepalives (RFC 4253 §11) that may arrive mid-auth; the
+  # session routes every post-handshake packet here by msg type, so swallow
+  # them instead of failing the handshake. Private (no `*`): session and
+  # channel already export these names.
+  MsgIgnore = 2'u8
+  MsgDebug = 4'u8
+  # Reply for unimplemented packet types (RFC 4253 §11.4), queued before
+  # reporting failure so the peer gets its reply via takeOutbox.
+  MsgUnimplemented = 3'u8
+
+proc buildUnimplemented(seqno: uint32): seq[byte] =
+  var w = initWriter()
+  w.writeByte(MsgUnimplemented)
+  w.writeUint32(seqno)
+  result = w.toBytes()
+
 type
   SshAuthError* = object of ValueError
 
@@ -221,8 +238,10 @@ proc takeOutbox*(c: var AuthClient): seq[seq[byte]] =
   result = c.outbox
   c.outbox = @[]
 
-proc authFeedInner(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
+proc authFeedInner(c: var AuthClient, payload: openArray[byte],
+                   seqno: uint32): AuthClientEvent =
   ## Drive one inbound message. Queues responses; reports terminal states.
+  ## `seqno` is the packet's sequence number for UNIMPLEMENTED replies.
   if payload.len == 0:
     return AuthClientEvent(kind: acWaiting)
   case payload[0]
@@ -267,14 +286,18 @@ proc authFeedInner(c: var AuthClient, payload: openArray[byte]): AuthClientEvent
     return AuthClientEvent(kind: acWaiting)
   of MsgUserauthBanner:
     return AuthClientEvent(kind: acBanner, message: "banner")
+  of MsgIgnore, MsgDebug:
+    return AuthClientEvent(kind: acWaiting)
   else:
+    c.outbox.add(buildUnimplemented(seqno))
     return AuthClientEvent(kind: acFailed,
       message: "unexpected auth message " & $payload[0])
 
-proc authFeed*(c: var AuthClient, payload: openArray[byte]): AuthClientEvent =
+proc authFeed*(c: var AuthClient, payload: openArray[byte],
+               seqno: uint32): AuthClientEvent =
   ## Drive one inbound message. Raises only SshAuthError on malformed input.
   try:
-    result = authFeedInner(c, payload)
+    result = authFeedInner(c, payload, seqno)
   except ValueError as e:
     raise newException(SshAuthError, "ssh auth: " & e.msg)
 
@@ -317,7 +340,8 @@ proc failMethods(s: AuthServer): seq[string] =
   if s.checkPassword != nil:
     result.add(MethodPassword)
 
-proc authFeedInner(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
+proc authFeedInner(s: var AuthServer, payload: openArray[byte],
+                   seqno: uint32): AuthServerEvent =
   ## Inner dispatch; raises SshAuthError/SshCodecError/SshKeyError.
   if payload.len == 0:
     return AuthServerEvent(kind: asWaiting)
@@ -375,12 +399,16 @@ proc authFeedInner(s: var AuthServer, payload: openArray[byte]): AuthServerEvent
     else:
       s.outbox.add(buildFailure(s.failMethods()))
       return AuthServerEvent(kind: asAttempt, user: req.user, meth: req.meth)
+  of MsgIgnore, MsgDebug:
+    return AuthServerEvent(kind: asWaiting)
   else:
+    s.outbox.add(buildUnimplemented(seqno))
     return AuthServerEvent(kind: asAttempt, message: "unexpected message")
 
-proc authFeed*(s: var AuthServer, payload: openArray[byte]): AuthServerEvent =
+proc authFeed*(s: var AuthServer, payload: openArray[byte],
+               seqno: uint32): AuthServerEvent =
   ## Drive one inbound message. Raises only SshAuthError on malformed input.
   try:
-    result = authFeedInner(s, payload)
+    result = authFeedInner(s, payload, seqno)
   except ValueError as e:
     raise newException(SshAuthError, "ssh auth: " & e.msg)

@@ -30,9 +30,9 @@ proc pumpUpper(cli, srv: var SshSession, ca: var AuthClient, sa: var AuthServer,
       for ev in srv.receiveBytes(pkt):
         if ev.kind == evPacket:
           if ev.payload[0] < 80:
-            discard sa.authFeed(ev.payload)
+            discard sa.authFeed(ev.payload, ev.seqno)
           else:
-            for ce in sm.feed(ev.payload):
+            for ce in sm.feed(ev.payload, ev.seqno):
               if onSrvChan != nil:
                 onSrvChan(ce)
     for p in sa.takeOutbox():
@@ -46,9 +46,9 @@ proc pumpUpper(cli, srv: var SshSession, ca: var AuthClient, sa: var AuthServer,
       for ev in cli.receiveBytes(pkt):
         if ev.kind == evPacket:
           if ev.payload[0] < 80:
-            discard ca.authFeed(ev.payload)
+            discard ca.authFeed(ev.payload, ev.seqno)
           else:
-            for ce in cm.feed(ev.payload):
+            for ce in cm.feed(ev.payload, ev.seqno):
               if onCliChan != nil:
                 onCliChan(ce)
     for p in ca.takeOutbox():
@@ -123,6 +123,54 @@ test "auth wrong password fails":
   pumpUpper(cli, srv, ca, sa, cm, sm)
   check not ca.done
   check not sa.done
+
+test "auth ignores transport keepalives mid-handshake":
+  let hk = generateEdKey()
+  let userKey = generateEdKey()
+  var cli = initClient(autoTrust = true)
+  var srv = initServer(hk)
+  cli.startHandshake()
+  srv.startHandshake()
+  pumpHs(cli, srv)
+
+  var ca = initAuthClient("u", cli.sessionId, userKey)
+  var sa = initAuthServer(srv.sessionId,
+    checkKey = proc(u, alg: string, blob: seq[byte]): bool {.closure.} = true)
+  # IGNORE(2) / DEBUG(4) must not fail auth nor queue replies.
+  for raw in [@[session.MsgIgnore], @[session.MsgDebug]]:
+    let cev = ca.authFeed(raw, 0)
+    check cev.kind == acWaiting
+    check ca.takeOutbox().len == 0
+    let sev = sa.authFeed(raw, 0)
+    check sev.kind == asWaiting
+    check sa.takeOutbox().len == 0
+  # Handshake still completes afterwards: keepalives did not derail it.
+  var cm = initMux(false)
+  var sm = initMux(true)
+  ca.authStart()
+  pumpUpper(cli, srv, ca, sa, cm, sm)
+  check ca.done
+  check sa.done
+
+test "unknown types answer UNIMPLEMENTED with packet seqno":
+  var cm = initMux(false)
+  # bare unknown type 250 at seqno 42 -> UNIMPLEMENTED(42) queued, then raise
+  var raised = false
+  try:
+    discard cm.feed(@[250'u8, 1, 2, 3], 42)
+  except ValueError:
+    raised = true
+  check raised
+  let ob = cm.takeOutbox()
+  check ob.len == 1
+  check ob[0] == @[3'u8, 0, 0, 0, 42]
+
+  var ca = initAuthClient("u", default(array[32, byte]), generateEdKey())
+  let cev = ca.authFeed(@[250'u8], 43)
+  check cev.kind == acFailed
+  let caOb = ca.takeOutbox()
+  check caOb.len == 1
+  check caOb[0] == @[3'u8, 0, 0, 0, 43]
 
 test "channel exec loopback over chacha session":
   let hk = generateEdKey()

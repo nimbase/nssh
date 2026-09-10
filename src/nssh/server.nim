@@ -26,7 +26,8 @@ type
     hostKey*: EdKeyPair
     conns*: Table[pointer, ServerConn]
     onReady*: proc(c: ServerConn) {.closure.}
-    onPacket*: proc(c: ServerConn, msgType: byte, payload: seq[byte]) {.closure.}
+    onPacket*: proc(c: ServerConn, msgType: byte, payload: seq[byte],
+                     seqno: uint32) {.closure.}
     onDisconnect*: proc(c: ServerConn, msg: string) {.closure.}
     onError*: proc(c: ServerConn, msg: string) {.closure.}
     onClose*: proc(c: ServerConn) {.closure.}
@@ -37,12 +38,14 @@ proc key(conn: Connection): pointer {.inline.} =
 proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
                    onReady: proc(c: ServerConn) {.closure.} = nil,
                    onPacket: proc(c: ServerConn, msgType: byte,
-                                  payload: seq[byte]) {.closure.} = nil,
+                                  payload: seq[byte],
+                                  seqno: uint32) {.closure.} = nil,
                    onDisconnect: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onError: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onClose: proc(c: ServerConn) {.closure.} = nil,
                    cipherOffer: seq[string] = @[],
-                   kexOffer: seq[string] = @[]): SshServer =
+                   kexOffer: seq[string] = @[],
+                   macOffer: seq[string] = @[]): SshServer =
   result = SshServer(loop: loop, hostKey: hostKey, conns: initTable[pointer, ServerConn](),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
@@ -55,6 +58,8 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
         sc.session.cipherOffer = offer
       if kexOffer.len > 0:
         sc.session.kexOffer = kexOffer
+      if macOffer.len > 0:
+        sc.session.macOffer = macOffer
       srv.conns[key(conn)] = sc
       sc.session.startHandshake()
       flushOutbox(conn, sc.session)
@@ -72,7 +77,7 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
       let onErrCb = srv.onError
       dispatch(events,
         onReady = (if onReadyCb != nil: (proc() {.closure.} = onReadyCb(sc)) else: nil),
-        onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte]) {.closure.} = onPacketCb(sc, m, p)) else: nil),
+        onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte], q: uint32) {.closure.} = onPacketCb(sc, m, p, q)) else: nil),
         onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(sc, m)) else: nil),
         onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(sc, m)) else: nil))
       closeIfDone(conn, sc.session)
