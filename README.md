@@ -1,8 +1,23 @@
-# nssh — pure-Nim SSH client and server
+<p align="center">
+  NSSH - Pure Nim SSH client and server<br>
+  Built on top of <a href="https://github.com/openpeeps/powpow">PowPow event library</a>
+</p>
 
-Modern-only SSH-2.0 client and server in strict pure Nim (no C, no OpenSSL).
-Async TCP comes from [`powpow`](https://github.com/openpeeps/powpow),
-crypto from [`nimcypher`](https://github.com/nimbase/nimcypher).
+<p align="center">
+  <code>nimble install nssh</code>
+</p>
+
+<p align="center">
+  <a href="https://nimbase.github.io/nssh">API reference</a><br>
+  <img src="https://github.com/nimbase/nssh/workflows/test/badge.svg" alt="Github Actions">  <img src="https://github.com/nimbase/nssh/workflows/docs/badge.svg" alt="Github Actions">
+</p>
+
+
+This is a modern-only SSH-2.0 client and server in strict pure Nim (no C, no OpenSSL). Async TCP comes from [`powpow`](https://github.com/openpeeps/powpow), crypto from [`nimcypher`](https://github.com/nimbase/nimcypher).
+
+## Key Features
+- Modern-only MVP
+- Built on top of PowPow event library
 
 ## Algorithm support (modern-only MVP)
 
@@ -67,11 +82,17 @@ let cli = newSshClient("127.0.0.1", 2222, autoTrust = true,
 )
 cli.poll() # or cli.run() to block
 
-# Force algorithms when needed:
+# Force algorithms with typed offers (kexOffer stays strings):
 let cli2 = dial("127.0.0.1", 2222, autoTrust = true,
   cipherOffer = @[ckAes128Ctr],
   macOffer = @[mkHmacSha256Etm])
+# The enums carry the wire strings as values ($ckAes128Ctr ==
+# "aes128-ctr"); parse strings with parseCipherKind/parseMacKind.
 ```
+
+Lifecycle: both sides own their event loop, so no `Loop` setup is
+needed. `srv.close()` stops listening and releases the server loop;
+`cli.close()` closes the connection and releases the client loop.
 
 `onPacket` receives the packet sequence number as third argument: pass it
 to `authFeed`/`ChannelMux.feed` so unknown message types get a correct
@@ -86,6 +107,5 @@ client against system `sshd` across a KEX × cipher × MAC matrix
 (curve25519/group14, CTR/CTR+ETM/GCM/chacha). It is part of `clue test`
 and skipped when OpenSSH is absent.
 
-## License
-
-MIT — see `LICENSE`.
+### 🎩 License
+MIT. Copyright George Lemon & Contributors &mdash; All rights reserved.
