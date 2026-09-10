@@ -11,6 +11,7 @@ import std/unittest
 import powpow
 
 import nssh/session
+import nssh/ciphers
 import nssh/codec
 import nssh/transport
 import nssh/auth
@@ -188,46 +189,45 @@ proc flushOut(cs: var SshSession, raw: Socket) =
     discard raw.send(addr pkt[0], pkt.len)
 
 test "negative interop: garbage version, oversize length, bad MAC close cleanly":
-  let loop = newLoop()
   let port = freePort()
   let hk = generateEdKey()
   var closed = 0
-  var srv = newSshServer(loop, hk, "127.0.0.1", port,
+  var srv = newSshServer(hk, "127.0.0.1", port,
     onClose = proc(c: ServerConn) = inc closed)
   for _ in 0 ..< 5:
-    loop.poll(10)
+    srv.poll(10)
   # 1. garbage version line
   var raw = newSocket()
   raw.connect("127.0.0.1", Port(port))
   raw.send("GET / HTTP/1.0\r\n\r\n")
   for _ in 0 ..< 40:
-    loop.poll(25)
+    srv.poll(25)
   raw.close()
   # 2. valid version, then oversize packet_length
   raw = newSocket()
   raw.connect("127.0.0.1", Port(port))
   raw.send("SSH-2.0-probe\r\n")
   for _ in 0 ..< 20:
-    loop.poll(25)
+    srv.poll(25)
   raw.send("\x7F\xFF\xFF\xFF\x00\x00\x00\x00")
   for _ in 0 ..< 40:
-    loop.poll(25)
+    srv.poll(25)
   raw.close()
   # 3. full handshake over a raw socket, then corrupt bytes post-NEWKEYS
   var cs = initClient(autoTrust = true)
-  cs.cipherOffer = @["aes128-ctr"]
-  var srv3 = newSshServer(loop, hk, "127.0.0.1", port + 1,
-    cipherOffer = @["aes128-ctr"],
+  cs.cipherOffer = @[ckAes128Ctr]
+  var srv3 = newSshServer(hk, "127.0.0.1", port + 1,
+    cipherOffer = @[ckAes128Ctr],
     onClose = proc(c: ServerConn) = inc closed)
   for _ in 0 ..< 5:
-    loop.poll(10)
+    srv3.poll(10)
   raw = newSocket()
   raw.connect("127.0.0.1", Port(port + 1))
   cs.startHandshake()
   flushOut(cs, raw)
   var openSeen = false
   for _ in 0 ..< 120:
-    loop.poll(5)
+    srv3.poll(5)
     if drainOne(raw, cs) == 1:
       break
     flushOut(cs, raw)
@@ -248,7 +248,7 @@ test "negative interop: garbage version, oversize length, bad MAC close cleanly"
   discard raw.send(addr wire[0][0], wire[0].len)
   var serverHungUp = false
   for _ in 0 ..< 120:
-    loop.poll(5)
+    srv3.poll(5)
     if drainOne(raw, cs) == 1:
       serverHungUp = true
       break
@@ -262,4 +262,3 @@ test "negative interop: garbage version, oversize length, bad MAC close cleanly"
   check closed >= 2
   srv.close()
   srv3.close()
-  loop.close()

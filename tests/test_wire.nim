@@ -21,7 +21,6 @@ proc ignoreText(p: seq[byte]): string =
   result = r.readStringStr()
 
 test "tcp loopback handshake + encrypted traffic":
-  let loop = newLoop()
   let port = freePort()
   let hk = generateEdKey()
 
@@ -34,7 +33,7 @@ test "tcp loopback handshake + encrypted traffic":
   var errLog: seq[string] = @[]
   var srvConn: ServerConn = nil
 
-  var srv = newSshServer(loop, hk, "127.0.0.1", port,
+  var srv = newSshServer(hk, "127.0.0.1", port,
     onReady = proc(c: ServerConn) =
       srvReady = true
       srvConn = c
@@ -48,7 +47,7 @@ test "tcp loopback handshake + encrypted traffic":
       errLog.add("srv: " & msg)
     ,
   )
-  var cli = dial(loop, "127.0.0.1", port, autoTrust = true,
+  var cli = dial("127.0.0.1", port, autoTrust = true,
     onReady = proc(c: SshClient) =
       cliReady = true
       cliSid = @(c.session.sessionId)
@@ -65,7 +64,8 @@ test "tcp loopback handshake + encrypted traffic":
   for _ in 0 ..< 500:
     if cliReady and srvReady:
       break
-    loop.poll(20)
+    cli.poll(20)
+    srv.poll(20)
   check cliReady
   check srvReady
   check cliSid == srvSid
@@ -75,17 +75,18 @@ test "tcp loopback handshake + encrypted traffic":
   for _ in 0 ..< 200:
     if srvGot != "":
       break
-    loop.poll(20)
+    cli.poll(20)
+    srv.poll(20)
   check srvGot == "hello-srv"
 
   srv.sendIgnore(srvConn, "hello-cli")
   for _ in 0 ..< 200:
     if cliGot != "":
       break
-    loop.poll(20)
+    cli.poll(20)
+    srv.poll(20)
   check cliGot == "hello-cli"
   check errLog.len == 0
 
   cli.close()
   srv.close()
-  loop.close()

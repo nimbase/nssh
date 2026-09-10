@@ -58,8 +58,8 @@ type
     iPeer*: seq[byte]
     kexOffer*: seq[string]
     hostKeyOffer*: seq[string]
-    cipherOffer*: seq[string]
-    macOffer*: seq[string]
+    cipherOffer*: seq[CipherKind]
+    macOffer*: seq[MacKind]
     ephLocal*: X25519KeyPair
     ephPeer*: array[32, byte]
     dhPriv*: seq[byte]       ## our DH private (group14), generated at init
@@ -89,10 +89,10 @@ proc initClient*(autoTrust = false): SshSession =
   result.vLocal = SshVersion
   result.kexOffer = @[KexCurve25519Sha256, KexGroup14Sha256]
   result.hostKeyOffer = @[HostKeyEd25519]
-  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr,
-                         $ckAes128Gcm, $ckAes256Gcm]
-  result.macOffer = @[$mkHmacSha256, $mkHmacSha512,
-                      $mkHmacSha256Etm, $mkHmacSha512Etm]
+  result.cipherOffer = @[ckChacha20Poly1305, ckAes128Ctr, ckAes256Ctr,
+                         ckAes128Gcm, ckAes256Gcm]
+  result.macOffer = @[mkHmacSha256, mkHmacSha512,
+                      mkHmacSha256Etm, mkHmacSha512Etm]
   result.ephLocal = x25519GenKey()
   result.dhPriv = dhPrivate()
   result.autoTrust = autoTrust
@@ -103,10 +103,10 @@ proc initServer*(hostKey: EdKeyPair): SshSession =
   result.vLocal = SshVersion
   result.kexOffer = @[KexCurve25519Sha256, KexGroup14Sha256]
   result.hostKeyOffer = @[HostKeyEd25519]
-  result.cipherOffer = @[$ckChacha20Poly1305, $ckAes128Ctr, $ckAes256Ctr,
-                         $ckAes128Gcm, $ckAes256Gcm]
-  result.macOffer = @[$mkHmacSha256, $mkHmacSha512,
-                      $mkHmacSha256Etm, $mkHmacSha512Etm]
+  result.cipherOffer = @[ckChacha20Poly1305, ckAes128Ctr, ckAes256Ctr,
+                         ckAes128Gcm, ckAes256Gcm]
+  result.macOffer = @[mkHmacSha256, mkHmacSha512,
+                      mkHmacSha256Etm, mkHmacSha512Etm]
   result.ephLocal = x25519GenKey()
   result.dhPriv = dhPrivate()
   result.hostKey = hostKey
@@ -154,10 +154,10 @@ proc parseKexInit*(payload: openArray[byte]): array[10, seq[string]] =
 proc localLists(s: SshSession): array[10, seq[string]] =
   result[0] = s.kexOffer
   result[1] = s.hostKeyOffer
-  result[2] = s.cipherOffer
-  result[3] = s.cipherOffer
-  result[4] = s.macOffer
-  result[5] = s.macOffer
+  result[2] = s.cipherOffer.mapIt($it)
+  result[3] = s.cipherOffer.mapIt($it)
+  result[4] = s.macOffer.mapIt($it)
+  result[5] = s.macOffer.mapIt($it)
   result[6] = @["none"]
   result[7] = @["none"]
   result[8] = @[]
@@ -170,13 +170,13 @@ proc pickFirst(clientPrefs, serverSupplied: openArray[string]): string =
         return c
   raise newException(SshSessionError, "ssh session: no matching algorithm")
 
-proc parseCipherKind(s: string): CipherKind =
+proc parseCipherKind*(s: string): CipherKind =
   for v in low(CipherKind) .. high(CipherKind):
     if $v == s:
       return v
   raise newException(SshSessionError, "ssh session: unknown cipher " & s)
 
-proc parseMacKind(s: string): MacKind =
+proc parseMacKind*(s: string): MacKind =
   for v in low(MacKind) .. high(MacKind):
     if $v == s:
       return v

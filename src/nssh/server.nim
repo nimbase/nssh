@@ -9,6 +9,7 @@ import std/tables
 import powpow
 
 import ./session
+import ./ciphers
 import ./wire
 import ./hostkeys
 
@@ -21,7 +22,7 @@ type
     session*: SshSession
 
   SshServer* = ref object
-    loop*: Loop
+    loop*: Loop ## event loop owned by the server (created in newSshServer)
     tcp*: TcpServer
     hostKey*: EdKeyPair
     conns*: Table[pointer, ServerConn]
@@ -35,7 +36,7 @@ type
 proc key(conn: Connection): pointer {.inline.} =
   cast[pointer](conn)
 
-proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
+proc newSshServer*(hostKey: EdKeyPair, address: string, port: int,
                    onReady: proc(c: ServerConn) {.closure.} = nil,
                    onPacket: proc(c: ServerConn, msgType: byte,
                                   payload: seq[byte],
@@ -43,15 +44,16 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
                    onDisconnect: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onError: proc(c: ServerConn, msg: string) {.closure.} = nil,
                    onClose: proc(c: ServerConn) {.closure.} = nil,
-                   cipherOffer: seq[string] = @[],
+                   cipherOffer: seq[CipherKind] = @[],
                    kexOffer: seq[string] = @[],
-                   macOffer: seq[string] = @[]): SshServer =
-  result = SshServer(loop: loop, hostKey: hostKey, conns: initTable[pointer, ServerConn](),
+                   macOffer: seq[MacKind] = @[]): SshServer =
+  result = SshServer(loop: newLoop(), hostKey: hostKey,
+                     conns: initTable[pointer, ServerConn](),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
   let srv = result
   let offer = cipherOffer
-  srv.tcp = newTcpServer(loop,
+  srv.tcp = newTcpServer(srv.loop,
     onAccept = proc(conn: Connection) =
       var sc = ServerConn(conn: conn, session: initServer(srv.hostKey))
       if offer.len > 0:
@@ -92,8 +94,18 @@ proc newSshServer*(loop: Loop, hostKey: EdKeyPair, address: string, port: int,
   )
   srv.tcp.listen(address, port)
 
+proc poll*(srv: SshServer, timeoutMs = 25) =
+  ## Drive the server's owned event loop once.
+  srv.loop.poll(timeoutMs)
+
+proc run*(srv: SshServer) =
+  ## Drive the server's owned event loop until stopped.
+  srv.loop.run()
+
 proc close*(srv: SshServer) =
+  ## Stop listening and release the owned event loop.
   srv.tcp.close()
+  srv.loop.close()
 
 proc sendIgnore*(srv: SshServer, c: ServerConn, data = "nssh") =
   c.session.sendIgnore(data)

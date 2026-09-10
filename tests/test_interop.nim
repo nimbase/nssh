@@ -15,6 +15,7 @@ import powpow
 
 import nssh/client
 import nssh/server
+import nssh/ciphers
 import nssh/auth
 import nssh/channel
 import nssh/codec
@@ -83,13 +84,12 @@ proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = ""): bool =
   let keyPath = tmp / "id_ed"
   doAssert execShellCmd("ssh-keygen -q -t ed25519 -N '' -f " & keyPath) == 0
 
-  let loop = newLoop()
   let port = freePort()
   let hk = generateEdKey()
   var apps = initTable[pointer, SrvApp]()
   var sawExec = ""
   var srv: SshServer
-  srv = newSshServer(loop, hk, "127.0.0.1", port,
+  srv = newSshServer(hk, "127.0.0.1", port,
     kexOffer = @[kexAlgo],
     onReady = proc(c: ServerConn) =
       apps[cast[pointer](c)] = SrvApp(
@@ -120,20 +120,20 @@ proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = ""): bool =
   if mac.len > 0:
     sshArgs.add(["-o", "MACs=" & mac])
   sshArgs.add(["interop@localhost", "echo hello-interop"])
+  var sshOut = ""
+  var sshErr = ""
+  var sshCode = -1
   try:
     let sshProc = startProcess("ssh", args = sshArgs, options = {poUsePath})
-    var sshOut = ""
-    var sshCode = -1
     for _ in 0 ..< 1200:
-      loop.poll(25)
+      srv.poll(25)
       sshCode = sshProc.peekExitCode()
       if sshCode != -1:
         break
     if sshCode == -1:
       sshProc.kill()
-      loop.poll(50)
+      srv.poll(50)
     sshOut = sshProc.outputStream().readAll()
-    var sshErr = ""
     try:
       sshErr = sshProc.errorStream().readAll()
     except ValueError:
@@ -146,7 +146,6 @@ proc runSshExecOnOurServer(kexAlgo, cipher: string, mac = ""): bool =
         " code=", sshCode, " out=", repr(sshOut), " err=", repr(sshErr)
   finally:
     srv.close()
-    loop.close()
 
 test "A: openssh client runs exec on our server":
   if not (haveTool("ssh") and haveTool("ssh-keygen")):
@@ -248,7 +247,6 @@ proc runOurClientOnSshd(kexAlgo, cipher: string, mac = ""): bool =
       sleep(50)
   check up
 
-  let loop = newLoop()
   let user = getEnv("USER", "nobody")
   var authed = false
   var gotData = ""
@@ -264,15 +262,15 @@ proc runOurClientOnSshd(kexAlgo, cipher: string, mac = ""): bool =
   var chId: uint32 = 0
   var cli: SshClient
   var dialKex: seq[string] = @[]
-  var dialCipher: seq[string] = @[]
-  var dialMac: seq[string] = @[]
+  var dialCipher: seq[CipherKind] = @[]
+  var dialMac: seq[MacKind] = @[]
   if kexAlgo.len > 0:
     dialKex = @[kexAlgo]
   if cipher.len > 0:
-    dialCipher = @[cipher]
+    dialCipher = @[parseCipherKind(cipher)]
   if mac.len > 0:
-    dialMac = @[mac]
-  cli = dial(loop, "127.0.0.1", port, autoTrust = true,
+    dialMac = @[parseMacKind(mac)]
+  cli = dial("127.0.0.1", port, autoTrust = true,
     onReady = proc(c: SshClient) =
       ca = initAuthClient(user, c.session.sessionId, userKey)
       ca.authStart()
@@ -323,10 +321,9 @@ proc runOurClientOnSshd(kexAlgo, cipher: string, mac = ""): bool =
     for _ in 0 ..< 800:
       if gotClosed and gotStatus == 0:
         break
-      loop.poll(25)
+      cli.poll(25)
   finally:
     cli.close()
-    loop.close()
   result = authed and chanOpened and gotData == "from-nssh\n" and
     gotStatus == 0 and gotClosed
   if not result:

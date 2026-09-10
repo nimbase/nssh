@@ -123,8 +123,8 @@ test "loopback handshake aes128-gcm, chunked":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes128Gcm]
-  srv.cipherOffer = @[$ckAes128Gcm]
+  cli.cipherOffer = @[ckAes128Gcm]
+  srv.cipherOffer = @[ckAes128Gcm]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv, chunkSize = 7)
@@ -144,8 +144,8 @@ test "loopback handshake aes128-ctr, 5-byte chunks":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes128Ctr]
-  srv.cipherOffer = @[$ckAes128Ctr]
+  cli.cipherOffer = @[ckAes128Ctr]
+  srv.cipherOffer = @[ckAes128Ctr]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv, chunkSize = 5)
@@ -166,10 +166,10 @@ test "loopback handshake aes256-ctr hmac-sha2-512-etm":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes256Ctr]
-  srv.cipherOffer = @[$ckAes256Ctr]
-  cli.macOffer = @[$mkHmacSha512Etm]
-  srv.macOffer = @[$mkHmacSha512Etm]
+  cli.cipherOffer = @[ckAes256Ctr]
+  srv.cipherOffer = @[ckAes256Ctr]
+  cli.macOffer = @[mkHmacSha512Etm]
+  srv.macOffer = @[mkHmacSha512Etm]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv)
@@ -188,8 +188,8 @@ test "loopback handshake aes256-gcm, chunked":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes256Gcm]
-  srv.cipherOffer = @[$ckAes256Gcm]
+  cli.cipherOffer = @[ckAes256Gcm]
+  srv.cipherOffer = @[ckAes256Gcm]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv, chunkSize = 7)
@@ -215,10 +215,10 @@ test "loopback handshake aes256-ctr hmac-sha2-256":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes256Ctr]
-  srv.cipherOffer = @[$ckAes256Ctr]
-  cli.macOffer = @[$mkHmacSha256]
-  srv.macOffer = @[$mkHmacSha256]
+  cli.cipherOffer = @[ckAes256Ctr]
+  srv.cipherOffer = @[ckAes256Ctr]
+  cli.macOffer = @[mkHmacSha256]
+  srv.macOffer = @[mkHmacSha256]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv)
@@ -238,10 +238,10 @@ test "loopback handshake aes128-ctr hmac-sha2-256-etm":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes128Ctr]
-  srv.cipherOffer = @[$ckAes128Ctr]
-  cli.macOffer = @[$mkHmacSha256Etm]
-  srv.macOffer = @[$mkHmacSha256Etm]
+  cli.cipherOffer = @[ckAes128Ctr]
+  srv.cipherOffer = @[ckAes128Ctr]
+  cli.macOffer = @[mkHmacSha256Etm]
+  srv.macOffer = @[mkHmacSha256Etm]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv)
@@ -278,8 +278,8 @@ test "disjoint cipher offers fail negotiation":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
-  cli.cipherOffer = @[$ckAes128Ctr]
-  srv.cipherOffer = @[$ckAes256Ctr]
+  cli.cipherOffer = @[ckAes128Ctr]
+  srv.cipherOffer = @[ckAes256Ctr]
   cli.startHandshake()
   srv.startHandshake()
   let (cEv, sEv) = pump(cli, srv)

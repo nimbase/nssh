@@ -47,30 +47,30 @@ clue test
 ## Usage
 
 ```nim
-import powpow
 import nssh/client
 import nssh/server
 import nssh/hostkeys
 
-let loop = newLoop()
-
-# Server: accept, then route packets to auth/channel layers in onPacket.
+# Server: the loop is owned internally; drive it with srv.poll/run.
 let hk = generateEdKey()
-let srv = newSshServer(loop, hk, "127.0.0.1", 2222,
+let srv = newSshServer(hk, "127.0.0.1", 2222,
   onPacket = proc(c: ServerConn, m: byte, p: seq[byte], q: uint32) =
     discard # feed p to AuthServer (< 80) or ChannelMux (>= 90) with seqno q
 )
+srv.poll() # or srv.run() to block
 
-# Client: trust-on-first-use here; pin host keys in real code.
-let cli = dial(loop, "127.0.0.1", 2222, autoTrust = true,
+# Client: likewise owns its loop (`dial` is an alias of `newSshClient`).
+# Trust-on-first-use here; pin host keys in real code.
+let cli = newSshClient("127.0.0.1", 2222, autoTrust = true,
   onReady = proc(c: SshClient) =
     discard # start auth with initAuthClient + authStart
 )
+cli.poll() # or cli.run() to block
 
 # Force algorithms when needed:
-let cli2 = dial(loop, "127.0.0.1", 2222, autoTrust = true,
-  cipherOffer = @["aes128-ctr"],
-  macOffer = @["hmac-sha2-256-etm@openssh.com"])
+let cli2 = dial("127.0.0.1", 2222, autoTrust = true,
+  cipherOffer = @[ckAes128Ctr],
+  macOffer = @[mkHmacSha256Etm])
 ```
 
 `onPacket` receives the packet sequence number as third argument: pass it

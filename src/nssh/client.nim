@@ -8,13 +8,14 @@ import powpow/net/tcp
 import powpow/proto/httpclient
 
 import ./session
+import ./ciphers
 import ./wire
 
 export session
 
 type
   SshClient* = ref object
-    loop*: Loop
+    loop*: Loop ## event loop owned by the client (created in newSshClient)
     conn*: Connection
     session*: SshSession
     connected*: bool
@@ -25,7 +26,7 @@ type
     onError*: proc(c: SshClient, msg: string) {.closure.}
     onClose*: proc(c: SshClient) {.closure.}
 
-proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
+proc newSshClient*(address: string, port: int, autoTrust = false,
            onReady: proc(c: SshClient) {.closure.} = nil,
            onPacket: proc(c: SshClient, msgType: byte,
                           payload: seq[byte],
@@ -33,10 +34,10 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
            onDisconnect: proc(c: SshClient, msg: string) {.closure.} = nil,
            onError: proc(c: SshClient, msg: string) {.closure.} = nil,
            onClose: proc(c: SshClient) {.closure.} = nil,
-           cipherOffer: seq[string] = @[],
+           cipherOffer: seq[CipherKind] = @[],
            kexOffer: seq[string] = @[],
-           macOffer: seq[string] = @[]): SshClient =
-  result = SshClient(loop: loop, session: initClient(autoTrust),
+           macOffer: seq[MacKind] = @[]): SshClient =
+  result = SshClient(loop: newLoop(), session: initClient(autoTrust),
                      onReady: onReady, onPacket: onPacket,
                      onDisconnect: onDisconnect, onError: onError, onClose: onClose)
   if cipherOffer.len > 0:
@@ -46,7 +47,7 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
   if macOffer.len > 0:
     result.session.macOffer = macOffer
   let cli = result
-  loop.connect(address, port,
+  cli.loop.connect(address, port,
     onConnect = proc(conn: Connection) =
       cli.conn = conn
       cli.connected = true
@@ -77,6 +78,29 @@ proc dial*(loop: Loop, address: string, port: int, autoTrust = false,
     ,
   )
 
+proc dial*(address: string, port: int, autoTrust = false,
+           onReady: proc(c: SshClient) {.closure.} = nil,
+           onPacket: proc(c: SshClient, msgType: byte,
+                          payload: seq[byte],
+                          seqno: uint32) {.closure.} = nil,
+           onDisconnect: proc(c: SshClient, msg: string) {.closure.} = nil,
+           onError: proc(c: SshClient, msg: string) {.closure.} = nil,
+           onClose: proc(c: SshClient) {.closure.} = nil,
+           cipherOffer: seq[CipherKind] = @[],
+           kexOffer: seq[string] = @[],
+           macOffer: seq[MacKind] = @[]): SshClient =
+  ## Alias for newSshClient.
+  newSshClient(address, port, autoTrust, onReady, onPacket, onDisconnect,
+    onError, onClose, cipherOffer, kexOffer, macOffer)
+
+proc poll*(cli: SshClient, timeoutMs = 25) =
+  ## Drive the client's owned event loop once.
+  cli.loop.poll(timeoutMs)
+
+proc run*(cli: SshClient) =
+  ## Drive the client's owned event loop until stopped.
+  cli.loop.run()
+
 proc sendIgnore*(cli: SshClient, data = "nssh") =
   cli.session.sendIgnore(data)
   flushOutbox(cli.conn, cli.session)
@@ -93,5 +117,7 @@ proc sendDisconnect*(cli: SshClient, reason: uint32, message: string) =
   cli.conn.close()
 
 proc close*(cli: SshClient) =
+  ## Close the connection (if any) and release the owned event loop.
   if cli.conn != nil:
     cli.conn.close()
+  cli.loop.close()
