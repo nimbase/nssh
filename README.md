@@ -190,4 +190,4 @@ and skipped when OpenSSH is absent.
   compression: these stay out by design, the MVP is modern-only
 
 ### 🎩 License
-MIT. Copyright George Lemon & Contributors &mdash; All rights reserved.
+MIT license
