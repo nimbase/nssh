@@ -1,6 +1,6 @@
 # SSH client over powpow: async connect, session handshake, event fan-out.
 #
-# Owns nothing: the caller creates the Loop and drives it (`poll`/`run`).
+# Owns its event loop: created in `newSshClient`, driven with `poll`/`run`.
 
 import powpow/loop
 import powpow/net
@@ -10,8 +10,10 @@ import powpow/proto/httpclient
 import ./session
 import ./ciphers
 import ./wire
+import ./knownhosts
 
 export session
+export knownhosts
 
 type
   SshClient* = ref object
@@ -25,6 +27,7 @@ type
     onDisconnect*: proc(c: SshClient, msg: string) {.closure.}
     onError*: proc(c: SshClient, msg: string) {.closure.}
     onClose*: proc(c: SshClient) {.closure.}
+    onRekey*: proc(c: SshClient) {.closure.}
 
 proc newSshClient*(address: string, port: int, autoTrust = false,
            onReady: proc(c: SshClient) {.closure.} = nil,
@@ -36,16 +39,38 @@ proc newSshClient*(address: string, port: int, autoTrust = false,
            onClose: proc(c: SshClient) {.closure.} = nil,
            cipherOffer: seq[CipherKind] = @[],
            kexOffer: seq[string] = @[],
-           macOffer: seq[MacKind] = @[]): SshClient =
+           macOffer: seq[MacKind] = @[],
+           verifyMode: VerifyMode = vmStrict,
+           knownHostsFile: string = "",
+           onHostKey: proc(host: string, port: int, alg: string,
+                            pubkey: array[32, byte]): bool {.closure.} = nil,
+           onRekey: proc(c: SshClient) {.closure.} = nil,
+           rekeyPolicy: RekeyPolicy = defaultRekeyPolicy(),
+           keepaliveIntervalMs = 0,
+           idleTimeoutMs = 0): SshClient =
   result = SshClient(loop: newLoop(), session: initClient(autoTrust),
                      onReady: onReady, onPacket: onPacket,
-                     onDisconnect: onDisconnect, onError: onError, onClose: onClose)
+                     onDisconnect: onDisconnect, onError: onError,
+                     onClose: onClose, onRekey: onRekey)
   if cipherOffer.len > 0:
     result.session.cipherOffer = cipherOffer
   if kexOffer.len > 0:
     result.session.kexOffer = kexOffer
   if macOffer.len > 0:
     result.session.macOffer = macOffer
+  # Host-key policy: legacy autoTrust wins; otherwise explicit mode + pins.
+  if autoTrust:
+    result.session.verifyMode = vmAutoTrust
+  else:
+    result.session.verifyMode = verifyMode
+  result.session.peerHost = address
+  result.session.peerPort = port
+  if knownHostsFile.len > 0:
+    result.session.knownHosts = loadKnownHosts(knownHostsFile)
+  if onHostKey != nil:
+    result.session.onHostKey = onHostKey
+  result.session.policy = rekeyPolicy
+  result.session.setKeepalive(keepaliveIntervalMs, idleTimeoutMs)
   let cli = result
   cli.loop.connect(address, port,
     onConnect = proc(conn: Connection) =
@@ -61,11 +86,13 @@ proc newSshClient*(address: string, port: int, autoTrust = false,
       let onPacketCb = cli.onPacket
       let onDiscCb = cli.onDisconnect
       let onErrCb = cli.onError
+      let onRekeyCb = cli.onRekey
       dispatch(events,
         onReady = (if onReadyCb != nil: (proc() {.closure.} = onReadyCb(cli)) else: nil),
         onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte], q: uint32) {.closure.} = onPacketCb(cli, m, p, q)) else: nil),
         onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(cli, m)) else: nil),
-        onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(cli, m)) else: nil))
+        onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(cli, m)) else: nil),
+        onRekey = (if onRekeyCb != nil: (proc() {.closure.} = onRekeyCb(cli)) else: nil))
       closeIfDone(conn, cli.session)
     ,
     onClose = proc(conn: Connection) =
@@ -88,14 +115,37 @@ proc dial*(address: string, port: int, autoTrust = false,
            onClose: proc(c: SshClient) {.closure.} = nil,
            cipherOffer: seq[CipherKind] = @[],
            kexOffer: seq[string] = @[],
-           macOffer: seq[MacKind] = @[]): SshClient =
+           macOffer: seq[MacKind] = @[],
+           verifyMode: VerifyMode = vmStrict,
+           knownHostsFile: string = "",
+           onHostKey: proc(host: string, port: int, alg: string,
+                            pubkey: array[32, byte]): bool {.closure.} = nil,
+           onRekey: proc(c: SshClient) {.closure.} = nil,
+           rekeyPolicy: RekeyPolicy = defaultRekeyPolicy(),
+           keepaliveIntervalMs = 0,
+           idleTimeoutMs = 0): SshClient =
   ## Alias for newSshClient.
   newSshClient(address, port, autoTrust, onReady, onPacket, onDisconnect,
-    onError, onClose, cipherOffer, kexOffer, macOffer)
+    onError, onClose, cipherOffer, kexOffer, macOffer, verifyMode,
+    knownHostsFile, onHostKey, onRekey, rekeyPolicy, keepaliveIntervalMs,
+    idleTimeoutMs)
 
 proc poll*(cli: SshClient, timeoutMs = 25) =
-  ## Drive the client's owned event loop once.
+  ## Drive the client's owned event loop once, then keepalive timers.
   cli.loop.poll(timeoutMs)
+  if cli.conn != nil and cli.session.stage == stOpen:
+    let evs = cli.session.pollKeepalive()
+    # pollKeepalive may queue IGNORE (no event) or DISCONNECT (evDisconnect).
+    flushOutbox(cli.conn, cli.session)
+    if evs.len > 0:
+      let onDiscCb = cli.onDisconnect
+      let onErrCb = cli.onError
+      let onRekeyCb = cli.onRekey
+      dispatch(evs,
+        onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(cli, m)) else: nil),
+        onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(cli, m)) else: nil),
+        onRekey = (if onRekeyCb != nil: (proc() {.closure.} = onRekeyCb(cli)) else: nil))
+      closeIfDone(cli.conn, cli.session)
 
 proc run*(cli: SshClient) =
   ## Drive the client's owned event loop until stopped.

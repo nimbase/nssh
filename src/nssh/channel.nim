@@ -63,6 +63,7 @@ type
   ChanEventKind* = enum
     cevOpened, cevOpenFailure, cevData, cevExtendedData, cevEof, cevClose,
     cevExec, cevShell, cevEnv, cevPty, cevExitStatus, cevExitSignal,
+    cevWindowChange, cevSignal, cevSubsystem,
     cevRequestOk, cevRequestFail, cevGlobalRequest
 
   ChanEvent* = object
@@ -73,6 +74,10 @@ type
     text*: string
     text2*: string
     status*: uint32
+    cols*: uint32
+    rows*: uint32
+    widthPx*: uint32
+    heightPx*: uint32
 
   ChannelMux* = object
     isServer*: bool
@@ -129,6 +134,56 @@ proc requestExec*(m: var ChannelMux, id: uint32, command: string) =
 
 proc requestShell*(m: var ChannelMux, id: uint32) =
   m.sendRequest(id, "shell", true)
+
+proc requestEnv*(m: var ChannelMux, id: uint32, name, value: string,
+    wantReply = true) =
+  m.sendRequest(id, "env", wantReply, proc(w: var Writer) {.closure.} =
+    w.writeString(name)
+    w.writeString(value))
+
+proc requestPty*(m: var ChannelMux, id: uint32, term: string,
+    cols, rows, widthPx, heightPx: uint32, modes: seq[byte] = @[],
+    wantReply = true) =
+  ## RFC 4254 §6.2 pty-req sender (dims + modes preserved, not discarded).
+  m.sendRequest(id, "pty-req", wantReply, proc(w: var Writer) {.closure.} =
+    w.writeString(term)
+    w.writeUint32(cols)
+    w.writeUint32(rows)
+    w.writeUint32(widthPx)
+    w.writeUint32(heightPx)
+    w.writeString(modes))
+
+proc requestWindowChange*(m: var ChannelMux, id: uint32,
+    cols, rows, widthPx, heightPx: uint32) =
+  ## RFC 4254 §6.7 window-change (no reply per spec).
+  m.sendRequest(id, "window-change", false,
+    proc(w: var Writer) {.closure.} =
+      w.writeUint32(cols)
+      w.writeUint32(rows)
+      w.writeUint32(widthPx)
+      w.writeUint32(heightPx))
+
+proc requestSignal*(m: var ChannelMux, id: uint32, signame: string) =
+  ## RFC 4254 §6.9 signal (no reply per spec, e.g. "INT", "TERM", "WINCH").
+  m.sendRequest(id, "signal", false, proc(w: var Writer) {.closure.} =
+    w.writeString(signame))
+
+proc requestSubsystem*(m: var ChannelMux, id: uint32, name: string,
+    wantReply = true) =
+  ## RFC 4254 §6.5 subsystem (e.g. "sftp"); peer replies SUCCESS/FAILURE.
+  m.sendRequest(id, "subsystem", wantReply,
+    proc(w: var Writer) {.closure.} =
+      w.writeString(name))
+
+proc sendExitSignal*(m: var ChannelMux, id: uint32, signame: string,
+    coreDumped = false, message = "", language = "") =
+  ## RFC 4254 §6.10 exit-signal sender (no reply per spec).
+  m.sendRequest(id, "exit-signal", false,
+    proc(w: var Writer) {.closure.} =
+      w.writeString(signame)
+      w.writeBool(coreDumped)
+      w.writeString(message)
+      w.writeString(language))
 
 proc sendExitStatus*(m: var ChannelMux, id: uint32, status: uint32) =
   m.sendRequest(id, "exit-status", false, proc(w: var Writer) {.closure.} =
@@ -214,6 +269,12 @@ proc replyRequest(m: var ChannelMux, c: Channel, ok: bool) =
   w.writeByte(if ok: MsgChannelSuccess else: MsgChannelFailure)
   w.writeUint32(c.remoteId)
   m.outbox.add(w.toBytes())
+
+proc replyChannelRequest*(m: var ChannelMux, id: uint32, ok: bool) =
+  ## Reply SUCCESS/FAILURE to a channel request by local id (e.g. decline
+  ## a subsystem with `ok=false`).
+  let c = m.get(id)
+  m.replyRequest(c, ok)
 
 proc buildUnimplemented(seqno: uint32): seq[byte] =
   var w = initWriter()
@@ -379,16 +440,46 @@ proc feedInner(m: var ChannelMux, payload: openArray[byte],
       result.add(ChanEvent(kind: cevEnv, localId: recipient, text: k, text2: v))
     of "pty-req":
       let term = r.readStringStr()
-      discard r.readUint32() # width chars
-      discard r.readUint32() # height rows
-      discard r.readUint32() # width px
-      discard r.readUint32() # height px
-      discard r.readString() # modes
+      let cols = r.readUint32()
+      let rows = r.readUint32()
+      let wpx = r.readUint32()
+      let hpx = r.readUint32()
+      let modes = r.readString()
       if not r.isExhausted():
         raise newException(SshChannelError, "ssh channel: pty trailing bytes")
       if wantReply:
         m.replyRequest(c, true)
-      result.add(ChanEvent(kind: cevPty, localId: recipient, text: term))
+      result.add(ChanEvent(kind: cevPty, localId: recipient, text: term,
+        cols: cols, rows: rows, widthPx: wpx, heightPx: hpx, data: modes))
+    of "window-change":
+      # RFC 4254 §6.7: cols rows widthPx heightPx, no reply.
+      let cols = r.readUint32()
+      let rows = r.readUint32()
+      let wpx = r.readUint32()
+      let hpx = r.readUint32()
+      if not r.isExhausted():
+        raise newException(SshChannelError, "ssh channel: window-change trailing")
+      if wantReply:
+        m.replyRequest(c, false)
+      result.add(ChanEvent(kind: cevWindowChange, localId: recipient,
+        cols: cols, rows: rows, widthPx: wpx, heightPx: hpx))
+    of "signal":
+      # RFC 4254 §6.9: signal name, no reply.
+      let signame = r.readStringStr()
+      if not r.isExhausted():
+        raise newException(SshChannelError, "ssh channel: signal trailing")
+      if wantReply:
+        m.replyRequest(c, false)
+      result.add(ChanEvent(kind: cevSignal, localId: recipient, text: signame))
+    of "subsystem":
+      # RFC 4254 §6.5: subsystem name. No auto-reply: the app authorizes
+      # (user/group Match, unknown subsystem) and answers explicitly
+      # with replyChannelRequest(id, ok). A missing reply leaves the
+      # client hanging, so apps must always answer wantReply requests.
+      let name = r.readStringStr()
+      if not r.isExhausted():
+        raise newException(SshChannelError, "ssh channel: subsystem trailing")
+      result.add(ChanEvent(kind: cevSubsystem, localId: recipient, text: name))
     of "exit-status":
       let st = r.readUint32()
       if not r.isExhausted():

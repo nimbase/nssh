@@ -1,10 +1,11 @@
 # SSH server over powpow: accept loop, per-connection sessions, event fan-out.
 #
-# Owns nothing: the caller creates the Loop and drives it (`poll`/`run`).
+# Owns its event loop: created in `newSshServer`, driven with `poll`/`run`.
 # Sessions live in a table keyed by connection identity; entries are dropped
 # on close so refs stay alive exactly as long as the connection.
 
 import std/tables
+import std/sequtils
 
 import powpow
 
@@ -32,6 +33,10 @@ type
     onDisconnect*: proc(c: ServerConn, msg: string) {.closure.}
     onError*: proc(c: ServerConn, msg: string) {.closure.}
     onClose*: proc(c: ServerConn) {.closure.}
+    onRekey*: proc(c: ServerConn) {.closure.}
+    rekeyPolicy*: RekeyPolicy
+    keepaliveIntervalMs*: int
+    idleTimeoutMs*: int
 
 proc key(conn: Connection): pointer {.inline.} =
   cast[pointer](conn)
@@ -46,11 +51,19 @@ proc newSshServer*(hostKey: EdKeyPair, address: string, port: int,
                    onClose: proc(c: ServerConn) {.closure.} = nil,
                    cipherOffer: seq[CipherKind] = @[],
                    kexOffer: seq[string] = @[],
-                   macOffer: seq[MacKind] = @[]): SshServer =
+                   macOffer: seq[MacKind] = @[],
+                   onRekey: proc(c: ServerConn) {.closure.} = nil,
+                   rekeyPolicy: RekeyPolicy = defaultRekeyPolicy(),
+                   keepaliveIntervalMs = 0,
+                   idleTimeoutMs = 0): SshServer =
   result = SshServer(loop: newLoop(), hostKey: hostKey,
                      conns: initTable[pointer, ServerConn](),
                      onReady: onReady, onPacket: onPacket,
-                     onDisconnect: onDisconnect, onError: onError, onClose: onClose)
+                     onDisconnect: onDisconnect, onError: onError,
+                     onClose: onClose, onRekey: onRekey,
+                     rekeyPolicy: rekeyPolicy,
+                     keepaliveIntervalMs: keepaliveIntervalMs,
+                     idleTimeoutMs: idleTimeoutMs)
   let srv = result
   let offer = cipherOffer
   srv.tcp = newTcpServer(srv.loop,
@@ -62,6 +75,8 @@ proc newSshServer*(hostKey: EdKeyPair, address: string, port: int,
         sc.session.kexOffer = kexOffer
       if macOffer.len > 0:
         sc.session.macOffer = macOffer
+      sc.session.policy = srv.rekeyPolicy
+      sc.session.setKeepalive(srv.keepaliveIntervalMs, srv.idleTimeoutMs)
       srv.conns[key(conn)] = sc
       sc.session.startHandshake()
       flushOutbox(conn, sc.session)
@@ -77,11 +92,13 @@ proc newSshServer*(hostKey: EdKeyPair, address: string, port: int,
       let onPacketCb = srv.onPacket
       let onDiscCb = srv.onDisconnect
       let onErrCb = srv.onError
+      let onRekeyCb = srv.onRekey
       dispatch(events,
         onReady = (if onReadyCb != nil: (proc() {.closure.} = onReadyCb(sc)) else: nil),
         onPacket = (if onPacketCb != nil: (proc(m: byte, p: seq[byte], q: uint32) {.closure.} = onPacketCb(sc, m, p, q)) else: nil),
         onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(sc, m)) else: nil),
-        onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(sc, m)) else: nil))
+        onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(sc, m)) else: nil),
+        onRekey = (if onRekeyCb != nil: (proc() {.closure.} = onRekeyCb(sc)) else: nil))
       closeIfDone(conn, sc.session)
     ,
     onClose = proc(conn: Connection) =
@@ -95,8 +112,23 @@ proc newSshServer*(hostKey: EdKeyPair, address: string, port: int,
   srv.tcp.listen(address, port)
 
 proc poll*(srv: SshServer, timeoutMs = 25) =
-  ## Drive the server's owned event loop once.
+  ## Drive the server's owned event loop once, then keepalive timers.
   srv.loop.poll(timeoutMs)
+  for k in toSeq(srv.conns.keys):
+    let sc = srv.conns.getOrDefault(k)
+    if sc == nil:
+      continue
+    if sc.session.stage == stOpen:
+      let evs = sc.session.pollKeepalive()
+      flushOutbox(sc.conn, sc.session)
+      if evs.len > 0:
+        let scCopy = sc
+        let onDiscCb = srv.onDisconnect
+        let onErrCb = srv.onError
+        dispatch(evs,
+          onDisconnect = (if onDiscCb != nil: (proc(m: string) {.closure.} = onDiscCb(scCopy, m)) else: nil),
+          onError = (if onErrCb != nil: (proc(m: string) {.closure.} = onErrCb(scCopy, m)) else: nil))
+        closeIfDone(sc.conn, sc.session)
 
 proc run*(srv: SshServer) =
   ## Drive the server's owned event loop until stopped.

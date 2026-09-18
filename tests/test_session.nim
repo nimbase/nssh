@@ -1,4 +1,5 @@
 import std/strutils
+import std/sequtils
 import std/unittest
 
 import nssh/session
@@ -95,8 +96,10 @@ test "loopback handshake chacha20-poly1305":
   check cli.sessionId == srv.sessionId
   check cli.H == srv.H
   check cli.K == srv.K
-  check cli.cipherKind == ckChacha20Poly1305
-  check srv.cipherKind == ckChacha20Poly1305
+  check cli.cipherC2s == ckChacha20Poly1305
+  check cli.cipherS2c == ckChacha20Poly1305
+  check srv.cipherC2s == ckChacha20Poly1305
+  check srv.cipherS2c == ckChacha20Poly1305
   # encrypted traffic both ways
   cli.sendIgnore("hello-srv")
   let r1 = pump(cli, srv)
@@ -130,7 +133,8 @@ test "loopback handshake aes128-gcm, chunked":
   let (cEv, sEv) = pump(cli, srv, chunkSize = 7)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.cipherKind == ckAes128Gcm
+  check cli.cipherC2s == ckAes128Gcm
+  check cli.cipherS2c == ckAes128Gcm
   check cli.K == srv.K
   cli.sendIgnore("gcm-ok")
   let r1 = pump(cli, srv, chunkSize = 7)
@@ -151,7 +155,8 @@ test "loopback handshake aes128-ctr, 5-byte chunks":
   let (cEv, sEv) = pump(cli, srv, chunkSize = 5)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.cipherKind == ckAes128Ctr
+  check cli.cipherC2s == ckAes128Ctr
+  check cli.cipherS2c == ckAes128Ctr
   check cli.K == srv.K
   check cli.sessionId == srv.sessionId
   cli.sendIgnore("ctr-ok")
@@ -175,7 +180,8 @@ test "loopback handshake aes256-ctr hmac-sha2-512-etm":
   let (cEv, sEv) = pump(cli, srv)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.macKind == mkHmacSha512Etm
+  check cli.macC2s == mkHmacSha512Etm
+  check cli.macS2c == mkHmacSha512Etm
   cli.sendIgnore("etm-ok")
   let r1 = pump(cli, srv)
   var got = false
@@ -195,7 +201,8 @@ test "loopback handshake aes256-gcm, chunked":
   let (cEv, sEv) = pump(cli, srv, chunkSize = 7)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.cipherKind == ckAes256Gcm
+  check cli.cipherC2s == ckAes256Gcm
+  check cli.cipherS2c == ckAes256Gcm
   check cli.K == srv.K
   cli.sendIgnore("gcm256-ok")
   srv.sendIgnore("gcm256-back")
@@ -224,8 +231,10 @@ test "loopback handshake aes256-ctr hmac-sha2-256":
   let (cEv, sEv) = pump(cli, srv)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.macKind == mkHmacSha256
-  check srv.macKind == mkHmacSha256
+  check cli.macC2s == mkHmacSha256
+  check cli.macS2c == mkHmacSha256
+  check srv.macC2s == mkHmacSha256
+  check srv.macS2c == mkHmacSha256
   cli.sendIgnore("ctr256-ok")
   let r1 = pump(cli, srv)
   var got = false
@@ -247,7 +256,8 @@ test "loopback handshake aes128-ctr hmac-sha2-256-etm":
   let (cEv, sEv) = pump(cli, srv)
   check hasReady(cEv)
   check hasReady(sEv)
-  check cli.macKind == mkHmacSha256Etm
+  check cli.macC2s == mkHmacSha256Etm
+  check cli.macS2c == mkHmacSha256Etm
   cli.sendIgnore("etm128-ok")
   let r1 = pump(cli, srv)
   var got = false
@@ -256,23 +266,27 @@ test "loopback handshake aes128-ctr hmac-sha2-256-etm":
       got = true
   check got
 
-test "asymmetric cipher directions rejected":
+test "asymmetric directions negotiated independently per RFC4253 7.1":
   let hk = generateEdKey()
   var srv = initServer(hk)
   srv.startHandshake()
   for ev in srv.receiveBytes(encodeVersionLine("SSH-2.0-fake")):
     check ev.kind != evErrorMsg
   check srv.stage == stKexInit
-  # Crafted peer KEXINIT: c2s aes128-ctr but s2c aes256-ctr.
+  # Peer offers direction-specific lists: c2s aes128-ctr, s2c aes256-ctr.
   var cookie: array[16, byte]
   let kexPayload = buildKexInit(cookie,
     @[KexCurve25519Sha256], @[HostKeyEd25519],
     @[$ckAes128Ctr], @[$ckAes256Ctr],
-    @[$mkHmacSha256], @[$mkHmacSha256],
+    @[$mkHmacSha256], @[$mkHmacSha256Etm],
     @["none"], @["none"], @[], @[])
   let ev = srv.receiveBytes(encodePacket(kexPayload, 8))
-  check hasError(ev)
-  check srv.stage == stClosed
+  check not hasError(ev)
+  check srv.stage == stKexDh
+  check srv.cipherC2s == ckAes128Ctr
+  check srv.cipherS2c == ckAes256Ctr
+  check srv.macC2s == mkHmacSha256
+  check srv.macS2c == mkHmacSha256Etm
 
 test "disjoint cipher offers fail negotiation":
   let hk = generateEdKey()
@@ -285,7 +299,51 @@ test "disjoint cipher offers fail negotiation":
   let (cEv, sEv) = pump(cli, srv)
   check hasError(cEv) or hasError(sEv)
 
-test "rekey KEXINIT refused with disconnect":
+test "asymmetric transport carries both directions with mixed ciphers/MACs":
+  let hk = generateEdKey()
+  var cli = initClient(autoTrust = true)
+  var srv = initServer(hk)
+  cli.startHandshake()
+  srv.startHandshake()
+  discard pump(cli, srv)
+  check cli.stage == stOpen
+  # Switch both sides to agreed asymmetric algorithms (C2S aes128-ctr +
+  # hmac-sha2-256, S2C aes256-ctr + hmac-sha2-512-etm), same K/H/sessionId.
+  # Exercises per-direction ETM framing and CTR states on the wire.
+  cli.cipherC2s = ckAes128Ctr
+  cli.cipherS2c = ckAes256Ctr
+  cli.macC2s = mkHmacSha256
+  cli.macS2c = mkHmacSha512Etm
+  srv.cipherC2s = ckAes128Ctr
+  srv.cipherS2c = ckAes256Ctr
+  srv.macC2s = mkHmacSha256
+  srv.macS2c = mkHmacSha512Etm
+  let sid = cli.sessionId.toSeq()
+  cli.keys = newSessionKeysAsym(cli.K, cli.H, sid, ckAes128Ctr, ckAes256Ctr,
+    mkHmacSha256, mkHmacSha512Etm, true)
+  srv.keys = newSessionKeysAsym(srv.K, srv.H, sid, ckAes128Ctr, ckAes256Ctr,
+    mkHmacSha256, mkHmacSha512Etm, false)
+  cli.sendIgnore("c2s-mixed")
+  srv.sendIgnore("s2c-mixed")
+  let r = pump(cli, srv, chunkSize = 5)
+  var gotC2s = false
+  var gotS2c = false
+  for e in r.sEv:
+    if e.kind == evPacket and e.msgType == MsgIgnore:
+      var rd = initReader(e.payload)
+      discard rd.readByte()
+      if rd.readStringStr() == "c2s-mixed":
+        gotC2s = true
+  for e in r.cEv:
+    if e.kind == evPacket and e.msgType == MsgIgnore:
+      var rd = initReader(e.payload)
+      discard rd.readByte()
+      if rd.readStringStr() == "s2c-mixed":
+        gotS2c = true
+  check gotC2s
+  check gotS2c
+
+test "rekey KEXINIT performs RFC4253 re-exchange, not disconnect":
   let hk = generateEdKey()
   var cli = initClient(autoTrust = true)
   var srv = initServer(hk)
@@ -294,23 +352,30 @@ test "rekey KEXINIT refused with disconnect":
   discard pump(cli, srv)
   check cli.stage == stOpen
   check srv.stage == stOpen
-  # Replay our own KEXINIT payload through the encrypted channel: content
-  # is irrelevant, the stage alone triggers refusal.
-  cli.sendPayload(cli.iLocal)
+  let sidBefore = cli.sessionId
+  check cli.requestRekey()
   let r1 = pump(cli, srv)
-  var gotDisc = ""
-  for e in r1.sEv:
-    if e.kind == evDisconnect:
-      gotDisc = e.message
-  check gotDisc.contains("rekey not supported")
-  check srv.stage == stClosed
-  # The refusal carries a DISCONNECT on the wire: pump already delivered
-  # it to the peer in the same round.
-  var gotPeerDisc = false
+  var rekeyed = 0
   for e in r1.cEv:
-    if e.kind == evDisconnect:
-      gotPeerDisc = true
-  check gotPeerDisc
+    if e.kind == evRekeyDone:
+      inc rekeyed
+  for e in r1.sEv:
+    if e.kind == evRekeyDone:
+      inc rekeyed
+  check rekeyed == 2
+  check cli.stage == stOpen
+  check srv.stage == stOpen
+  check cli.sessionId == sidBefore
+  check srv.sessionId == sidBefore
+  check cli.K == srv.K
+  # Traffic flows under the new keys with continuing sequence numbers.
+  cli.sendIgnore("post-rekey")
+  let r2 = pump(cli, srv)
+  var got = false
+  for e in r2.sEv:
+    if e.kind == evPacket and e.msgType == MsgIgnore:
+      got = true
+  check got
 
 test "receive sequence rollover refused, not wrapped":
   let hk = generateEdKey()

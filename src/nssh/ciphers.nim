@@ -297,13 +297,28 @@ proc newDirectionKeys*(K: openArray[byte], H: array[32, byte],
                           mac: if cspec.isAead: mkNone else: macKind,
                           macKey: mk)
 
+proc newSessionKeysAsym*(K: openArray[byte], H: array[32, byte],
+    sessionId: openArray[byte], cipherC2s, cipherS2c: CipherKind,
+    macC2s, macS2c: MacKind, isClient: bool): SessionKeys =
+  ## RFC 4253 §7.1/§7.2 with independent per-direction algorithms.
+  ## C2S uses letters (A, C, E), S2C uses (B, D, F); each endpoint maps
+  ## toPeer/fromPeer onto the right direction for its role. AEAD ciphers
+  ## force `mkNone` per direction inside `newDirectionKeys`.
+  if isClient:
+    result.toPeer = newDirectionKeys(K, H, sessionId, cipherC2s, macC2s,
+      'A', 'C', 'E')
+    result.fromPeer = newDirectionKeys(K, H, sessionId, cipherS2c, macS2c,
+      'B', 'D', 'F')
+  else:
+    result.toPeer = newDirectionKeys(K, H, sessionId, cipherS2c, macS2c,
+      'B', 'D', 'F')
+    result.fromPeer = newDirectionKeys(K, H, sessionId, cipherC2s, macC2s,
+      'A', 'C', 'E')
+
 proc newSessionKeys*(K: openArray[byte], H: array[32, byte],
                      sessionId: openArray[byte], cipherKind: CipherKind,
                      macKind: MacKind, isClient: bool): SessionKeys =
   ## Client sends with (A, C, E) and receives with (B, D, F); server mirrors.
-  if isClient:
-    result.toPeer = newDirectionKeys(K, H, sessionId, cipherKind, macKind, 'A', 'C', 'E')
-    result.fromPeer = newDirectionKeys(K, H, sessionId, cipherKind, macKind, 'B', 'D', 'F')
-  else:
-    result.toPeer = newDirectionKeys(K, H, sessionId, cipherKind, macKind, 'B', 'D', 'F')
-    result.fromPeer = newDirectionKeys(K, H, sessionId, cipherKind, macKind, 'A', 'C', 'E')
+  ## Symmetric convenience wrapper around `newSessionKeysAsym`.
+  result = newSessionKeysAsym(K, H, sessionId, cipherKind, cipherKind,
+    macKind, macKind, isClient)

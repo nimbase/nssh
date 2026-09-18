@@ -19,6 +19,7 @@ import nssh/ciphers
 import nssh/auth
 import nssh/channel
 import nssh/codec
+import nssh/sftp
 
 proc freePort(): int =
   var s = newSocket()
@@ -346,3 +347,121 @@ test "B2: our client with forced algorithms":
   check runOurClientOnSshd("curve25519-sha256", "aes128-gcm@openssh.com")
   check runOurClientOnSshd("diffie-hellman-group14-sha256", "aes256-ctr",
     "hmac-sha2-512")
+
+# ── C: system sftp client against OUR server ──────────────────────────────────
+
+type
+  SftpSrvApp = ref object
+    auth: AuthServer
+    mux: ChannelMux
+    sftp: SftpServer
+    hasSftp: bool
+    sftpCh: uint32
+
+proc routeSftpSrvApp(srv: SshServer, c: ServerConn, app: SftpSrvApp,
+                     msgType: byte, payload: seq[byte], seqno: uint32) =
+  if msgType < 80:
+    discard app.auth.authFeed(payload, seqno)
+    for p in app.auth.takeOutbox():
+      srv.sendRaw(c, p)
+  else:
+    for ev in app.mux.feed(payload, seqno):
+      case ev.kind
+      of cevSubsystem:
+        if ev.text == "sftp":
+          app.hasSftp = true
+          app.sftpCh = ev.localId
+          app.mux.replyChannelRequest(ev.localId, true)
+        else:
+          app.mux.replyChannelRequest(ev.localId, false)
+      of cevData:
+        if app.hasSftp and ev.localId == app.sftpCh:
+          app.sftp.sftpFeed(ev.data)
+          for resp in app.sftp.takeSftpOutbox():
+            discard app.mux.sendData(app.sftpCh, resp)
+      of cevEof:
+        # Half-close handshake (RFC 4254 §5.3): client sent EOF and
+        # waits for our EOF+CLOSE before sending its CLOSE.
+        if app.hasSftp and ev.localId == app.sftpCh:
+          app.mux.sendEof(ev.localId)
+          app.mux.sendClose(ev.localId)
+      of cevClose:
+        app.hasSftp = false
+      else:
+        discard
+    for p in app.mux.takeOutbox():
+      srv.sendRaw(c, p)
+
+proc runSftpOnOurServer(): bool =
+  ## System `sftp` batch session against our SFTP subsystem. Returns
+  ## true on clean put/get/rename/remove/mkdir/rmdir round trip.
+  let tag = "sftp-" & $getCurrentProcessId()
+  let tmp = getTempDir() / ("nssh-interop-c-" & tag)
+  createDir(tmp)
+  defer: removeDir(tmp)
+  let keyPath = tmp / "id_ed"
+  doAssert execShellCmd("ssh-keygen -q -t ed25519 -N '' -f " & keyPath) == 0
+  let srvRoot = tmp / "srv"
+  createDir(srvRoot)
+  writeFile(tmp / "local.txt", "sftp-interop-payload\n")
+  writeFile(tmp / "batch",
+    "put local.txt up.txt\nls\nrename up.txt down.txt\n" &
+    "get down.txt got.txt\nrm down.txt\nmkdir subdir\nrmdir subdir\n")
+
+  let port = freePort()
+  let hk = generateEdKey()
+  var apps = initTable[pointer, SftpSrvApp]()
+  var srv: SshServer
+  srv = newSshServer(hk, "127.0.0.1", port,
+    onReady = proc(c: ServerConn) =
+      apps[cast[pointer](c)] = SftpSrvApp(
+        auth: initAuthServer(c.session.sessionId,
+          checkKey = proc(u, alg: string, blob: seq[byte]): bool {.closure.} = true),
+        mux: initMux(true),
+        sftp: initSftpServer(newOsBackend(srvRoot)))
+    ,
+    onPacket = proc(c: ServerConn, m: byte, p: seq[byte], q: uint32) =
+      let app = apps.getOrDefault(cast[pointer](c))
+      if app != nil:
+        routeSftpSrvApp(srv, c, app, m, p, q)
+    ,
+    onClose = proc(c: ServerConn) =
+      apps.del(cast[pointer](c))
+    ,
+  )
+  let sftpArgs = @["-P", $port, "-i", keyPath,
+             "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "ConnectTimeout=10",
+             "-o", "LogLevel=ERROR",
+             "-b", tmp / "batch",
+             "interop@127.0.0.1"]
+  var sftpCode = -1
+  var sftpOut = ""
+  try:
+    let sftpProc = startProcess("sftp", args = sftpArgs,
+      workingDir = tmp, options = {poUsePath})
+    for _ in 0 ..< 1200:
+      srv.poll(25)
+      sftpCode = sftpProc.peekExitCode()
+      if sftpCode != -1:
+        break
+    if sftpCode == -1:
+      sftpProc.kill()
+      srv.poll(50)
+    sftpOut = sftpProc.outputStream().readAll()
+    sftpCode = sftpProc.peekExitCode()
+    sftpProc.close()
+    let gotOk = fileExists(tmp / "got.txt") and
+      readFile(tmp / "got.txt") == "sftp-interop-payload\n"
+    result = sftpCode == 0 and gotOk and not fileExists(srvRoot / "down.txt")
+    if not result:
+      echo "INTEROP DIAG sftp code=", sftpCode, " out=", repr(sftpOut)
+  finally:
+    srv.close()
+
+test "C: openssh sftp client round trips on our server":
+  if not (haveTool("sftp") and haveTool("ssh-keygen")):
+    skip()
+  check runSftpOnOurServer()

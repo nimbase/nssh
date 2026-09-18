@@ -8,6 +8,7 @@
 
 import std/sysrand
 import std/sequtils
+import std/monotimes
 
 import ./codec
 import ./transport
@@ -20,14 +21,29 @@ const
   MsgIgnore* = 2'u8
   MsgUnimplemented* = 3'u8
   MsgDebug* = 4'u8
+  MsgServiceRequest* = 5'u8
+  MsgServiceAccept* = 6'u8
   MsgKexInit* = 20'u8
   MsgNewKeys* = 21'u8
   MsgKexDhInit* = 30'u8
   MsgKexDhReply* = 31'u8
 
-  # We do not implement rekeying (modern-only MVP): a peer KEXINIT after
-  # the initial exchange is refused with this reason, not silently dropped.
+  # RFC 4253 §11.1 reason codes.
+  DisconnectHostNotAllowedToConnect* = 1'u32
+  DisconnectProtocolError* = 2'u32
   DisconnectKeyExchangeFailed* = 3'u32
+  DisconnectReserved* = 4'u32
+  DisconnectMacError* = 5'u32
+  DisconnectCompressionError* = 6'u32
+  DisconnectServiceNotAvailable* = 7'u32
+  DisconnectProtocolVersionNotSupported* = 8'u32
+  DisconnectHostKeyNotVerifiable* = 9'u32
+  DisconnectConnectionLost* = 10'u32
+  DisconnectByApplication* = 11'u32
+  DisconnectTooManyConnections* = 12'u32
+  DisconnectAuthCancelledByUser* = 13'u32
+  DisconnectNoMoreAuthMethodsAvailable* = 14'u32
+  DisconnectIllegalUserName* = 15'u32
 
 type
   SshSessionError* = object of ValueError
@@ -39,7 +55,37 @@ type
     stVersion, stKexInit, stKexDh, stNewKeys, stOpen, stClosed
 
   EventKind* = enum
-    evReady, evPacket, evDisconnect, evErrorMsg
+    evReady, evPacket, evDisconnect, evErrorMsg, evRekeyDone
+
+  RekeyState* = enum
+    ## RFC 4253 §9 re-exchange progress while `stage == stOpen`.
+    ## `rsIdle` = no rekey in flight. Any other value means we have sent
+    ## (or are responding with) KEXINIT and app data must be queued
+    ## per §7.1 until we have sent NEWKEYS.
+    rsIdle, rsKexInitSent, rsKexDh, rsNewKeysSent
+
+  RekeyPolicy* = object
+    ## Automatic rekey triggers (RFC 4253 §9 RECOMMENDS 1 GB / 1 hour).
+    ## Zero disables that trigger. Checked after each send/receive and
+    ## from `client`/`server` poll loops via `maybeTriggerRekey`.
+    maxBytesSent*: uint64
+    maxBytesRecv*: uint64
+    maxPacketsSent*: uint64
+    maxPacketsRecv*: uint64
+    maxSeconds*: int64
+    seqnoMargin*: uint32  ## rekey when within N packets of 2^32 wrap
+
+  VerifyMode* = enum
+    ## Host-key verification policy (client side).
+    vmAutoTrust,  ## accept and continue (tests / TOFU without storage)
+    vmStrict,     ## require match in `knownHosts` or `onHostKey` approval
+    vmTofu        ## trust on first use, persist via `onHostKey` / file
+
+  KnownHostEntry* = object
+    host*: string
+    port*: int  ## -1 = any port
+    alg*: string
+    pubkey*: array[32, byte]
 
   SessionEvent* = object
     kind*: EventKind
@@ -67,10 +113,18 @@ type
     hostKey*: EdKeyPair      ## server signing key
     hasHostKey*: bool
     autoTrust*: bool         ## client: accept unknown host keys (tests)
+    verifyMode*: VerifyMode
+    knownHosts*: seq[KnownHostEntry]
+    onHostKey*: proc(host: string, port: int, alg: string,
+                     pubkey: array[32, byte]): bool {.closure.}
+    peerHost*: string        ## remote host for known-hosts matching
+    peerPort*: int
     kexName*: string
     hostKeyName*: string
-    cipherKind*: CipherKind
-    macKind*: MacKind
+    cipherC2s*: CipherKind  ## RFC 4253 §7.1 independent per-direction
+    cipherS2c*: CipherKind  ## selection; may differ when the peer offers
+    macC2s*: MacKind        ## direction-specific lists
+    macS2c*: MacKind
     K*: seq[byte]            ## shared secret, unsigned BE
     H*: array[32, byte]
     sessionId*: array[32, byte]
@@ -82,6 +136,65 @@ type
     recvSeq*: uint32
     inBuf*: seq[byte]
     outbox*: seq[seq[byte]]
+    # ── RFC 4253 §9 rekey state ──
+    rekey*: RekeyState
+    pendingILocal*: seq[byte]
+    pendingIPeer*: seq[byte]
+    pendingKexName*: string
+    pendingHostKeyName*: string
+    pendingCipherC2s*: CipherKind
+    pendingCipherS2c*: CipherKind
+    pendingMacC2s*: MacKind
+    pendingMacS2c*: MacKind
+    pendingK*: seq[byte]
+    pendingH*: array[32, byte]
+    hasPendingH*: bool
+    pendingKeys*: SessionKeys
+    hasPendingKeys*: bool
+    sendNewKeysSent*: bool   ## we switched send keys, wait peer NEWKEYS
+    recvNewKeysGot*: bool    ## peer NEWKEYS processed, recv keys switched
+    appQueue*: seq[seq[byte]] ## app payloads queued during rekey (§7.1)
+    # ── triggers / accounting ──
+    policy*: RekeyPolicy
+    bytesSent*: uint64
+    bytesRecv*: uint64
+    packetsSent*: uint64
+    packetsRecv*: uint64
+    lastRekeyNanos*: int64
+    # ── keepalive ──
+    keepaliveIntervalMs*: int
+    keepalivePayload*: string
+    idleTimeoutMs*: int
+    lastSendNanos*: int64
+    lastRecvNanos*: int64
+
+proc cipherKind*(s: SshSession): CipherKind {.deprecated:
+  "Use cipherC2s/cipherS2c; asymmetric directions may differ (RFC 4253 §7.1)".} =
+  ## Backward-compat reader: client-to-server direction.
+  s.cipherC2s
+
+proc macKind*(s: SshSession): MacKind {.deprecated:
+  "Use macC2s/macS2c; asymmetric directions may differ (RFC 4253 §7.1)".} =
+  s.macC2s
+
+proc defaultRekeyPolicy*(): RekeyPolicy =
+  ## RFC 4253 §9 RECOMMENDED 1 GB / 1 hour, plus packet-count and
+  ## sequence-margin backstops so we rekey well before 2^32 wrap.
+  RekeyPolicy(maxBytesSent: 1_000_000_000'u64, maxBytesRecv: 1_000_000_000'u64,
+    maxPacketsSent: 1_000_000'u64, maxPacketsRecv: 1_000_000'u64,
+    maxSeconds: 3600, seqnoMargin: 65535)
+
+proc nowNanos(): int64 =
+  getMonoTime().ticks
+
+proc initRekeyAccounting(s: var SshSession) =
+  let n = nowNanos()
+  s.lastRekeyNanos = n
+  s.lastSendNanos = n
+  s.lastRecvNanos = n
+
+proc isRekeying*(s: SshSession): bool {.inline.} =
+  s.stage == stOpen and s.rekey != rsIdle
 
 proc initClient*(autoTrust = false): SshSession =
   result.role = rClient
@@ -96,6 +209,11 @@ proc initClient*(autoTrust = false): SshSession =
   result.ephLocal = x25519GenKey()
   result.dhPriv = dhPrivate()
   result.autoTrust = autoTrust
+  result.verifyMode = if autoTrust: vmAutoTrust else: vmStrict
+  result.peerPort = 22
+  result.keepalivePayload = "nssh"
+  result.policy = defaultRekeyPolicy()
+  result.initRekeyAccounting()
 
 proc initServer*(hostKey: EdKeyPair): SshSession =
   result.role = rServer
@@ -111,6 +229,10 @@ proc initServer*(hostKey: EdKeyPair): SshSession =
   result.dhPriv = dhPrivate()
   result.hostKey = hostKey
   result.hasHostKey = true
+  result.verifyMode = vmAutoTrust
+  result.keepalivePayload = "nssh"
+  result.policy = defaultRekeyPolicy()
+  result.initRekeyAccounting()
 
 proc takeOutbox*(s: var SshSession): seq[seq[byte]] =
   result = s.outbox
@@ -184,19 +306,71 @@ proc parseMacKind*(s: string): MacKind =
 
 # ── send path ───────────────────────────────────────────────────────────────
 
-proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
+proc freshEphemeral(s: var SshSession) =
+  ## Fresh KEX secrets for initial or rekey KEXINIT (RFC 4253 §9:
+  ## contexts reset, keys recomputed; ephemeral MUST NOT be reused).
+  s.ephLocal = x25519GenKey()
+  s.dhPriv = dhPrivate()
+
+proc buildLocalKexPayload(s: SshSession): seq[byte] =
+  var cookie: array[16, byte]
+  let rnd = urandom(16)
+  copyMem(addr cookie[0], unsafeAddr rnd[0], 16)
+  let loc = s.localLists()
+  result = buildKexInit(cookie, loc[0], loc[1], loc[2], loc[3], loc[4],
+    loc[5], loc[6], loc[7], loc[8], loc[9])
+
+proc selectAlgorithms(cLists, svLists: array[10, seq[string]]): tuple[
+    kex, hostkey, cipherC2s, cipherS2c, macC2s, macS2c: string] =
+  ## RFC 4253 §7.1: each direction is negotiated independently as the
+  ## first algorithm on the client's list that is also on the server's
+  ## list. Directions MAY differ when peers offer direction-specific lists.
+  result.kex = pickFirst(cLists[0], svLists[0])
+  if result.kex != KexCurve25519Sha256 and result.kex != KexGroup14Sha256:
+    raise newException(SshSessionError, "ssh session: unsupported kex " & result.kex)
+  result.hostkey = pickFirst(cLists[1], svLists[1])
+  if result.hostkey != HostKeyEd25519:
+    raise newException(SshSessionError, "ssh session: unsupported hostkey")
+  result.cipherC2s = pickFirst(cLists[2], svLists[2])
+  result.cipherS2c = pickFirst(cLists[3], svLists[3])
+  result.macC2s = pickFirst(cLists[4], svLists[4])
+  result.macS2c = pickFirst(cLists[5], svLists[5])
+
+proc isAllowedDuringRekey(msgType: byte): bool {.inline.} =
+  ## RFC 4253 §7.1: after KEXINIT until NEWKEYS, MUST NOT send other than
+  ## transport-generic (1-19, minus SERVICE_REQUEST/ACCEPT) + kex (20-29
+  ## minus further KEXINIT, + 30-49). DISCONNECT/IGNORE/DEBUG/UNIMPLEMENTED
+  ## always flow; everything else (>=50 auth/channel) is queued.
+  if msgType == MsgKexInit or msgType == MsgNewKeys:
+    return true
+  if msgType >= 30 and msgType <= 49:
+    return true
+  if msgType == MsgDisconnect or msgType == MsgIgnore or
+     msgType == MsgUnimplemented or msgType == MsgDebug:
+    return true
+  if msgType >= 7 and msgType <= 19:
+    return true
+  return false
+
+proc sendPayloadInner(s: var SshSession, payload: openArray[byte]) =
   ## BPP-encode (+ encrypt/MAC when active), queue wire bytes, bump seqno.
-  ## Raises instead of wrapping the sequence number (rekey before 2^32).
+  ## Sequence numbers are never reset across rekey (RFC 4253 §6.4); the
+  ## caller must rekey before 2^32. Raises instead of wrapping as a
+  ## last-resort guard (policy triggers long before).
   if s.sendSeq == high(uint32):
     raise newException(SshSessionError, "ssh session: sequence rollover, rekey first")
-  let spec = specFor(s.cipherKind)
+  # When keys are active, the cipher kind lives in the directional state
+  # so the two directions can differ per RFC 4253 §7.1 (and transiently
+  # across NEWKEYS during rekey).
+  let activeCipher =
+    if s.sendActive: s.keys.toPeer.cipher.kind else: ckNone
+  let spec = specFor(if s.sendActive: activeCipher else: ckNone)
   if not s.sendActive:
-    s.outbox.add(encodePacket(payload, 8))
-  elif s.cipherKind == ckAes128Ctr or s.cipherKind == ckAes256Ctr:
+    let wire = encodePacket(payload, 8)
+    s.bytesSent += uint64(wire.len)
+    s.outbox.add(wire)
+  elif activeCipher == ckAes128Ctr or activeCipher == ckAes256Ctr:
     if isEtm(s.keys.toPeer.mac):
-      # ETM: packet_length travels in clear (OpenSSH packet.c `aadlen`),
-      # so packlen itself must be block-aligned; only the rest is CTR
-      # encrypted with the running counter (length consumes no keystream).
       let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
       let ctRest = s.keys.toPeer.cipher.ctrCrypt(enc.toOpenArray(4, enc.high))
       var wire = newSeq[byte](4 + ctRest.len)
@@ -204,14 +378,18 @@ proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
       copyMem(addr wire[4], unsafeAddr ctRest[0], ctRest.len)
       let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
         wire.toOpenArray(0, wire.high))
-      s.outbox.add(wire & m)
+      let full = wire & m
+      s.bytesSent += uint64(full.len)
+      s.outbox.add(full)
     else:
       let enc = encodePacket(payload, spec.blockSize)
       let ct = s.keys.toPeer.cipher.ctrCrypt(enc)
       let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
         enc.toOpenArray(0, enc.high))
-      s.outbox.add(ct & m)
-  elif s.cipherKind == ckAes128Gcm or s.cipherKind == ckAes256Gcm:
+      let full = ct & m
+      s.bytesSent += uint64(full.len)
+      s.outbox.add(full)
+  elif activeCipher == ckAes128Gcm or activeCipher == ckAes256Gcm:
     let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
     var plen: array[4, byte]
     for i in 0 ..< 4: plen[i] = enc[i]
@@ -220,8 +398,9 @@ proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
     copyMem(addr wire[0], unsafeAddr plen[0], 4)
     copyMem(addr wire[4], unsafeAddr sealed.ct[0], sealed.ct.len)
     copyMem(addr wire[4 + sealed.ct.len], unsafeAddr sealed.tag[0], 16)
+    s.bytesSent += uint64(wire.len)
     s.outbox.add(wire)
-  elif s.cipherKind == ckChacha20Poly1305:
+  elif activeCipher == ckChacha20Poly1305:
     let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
     var plen: array[4, byte]
     for i in 0 ..< 4: plen[i] = enc[i]
@@ -233,22 +412,117 @@ proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
     copyMem(addr wire[0], unsafeAddr encLen[0], 4)
     copyMem(addr wire[4], unsafeAddr sealed.ct[0], sealed.ct.len)
     copyMem(addr wire[4 + sealed.ct.len], unsafeAddr tag[0], 16)
+    s.bytesSent += uint64(wire.len)
     s.outbox.add(wire)
   else:
     raise newException(SshSessionError, "ssh session: cipher not wired")
   inc s.sendSeq
+  inc s.packetsSent
+  s.lastSendNanos = nowNanos()
+
+proc needsRekey*(s: SshSession, nowNanosVal = 0'i64): bool =
+  ## True when any automatic trigger fires. `nowNanosVal` injectable for tests.
+  if s.stage != stOpen:
+    return false
+  let p = s.policy
+  if p.maxPacketsSent > 0 and s.packetsSent >= p.maxPacketsSent:
+    return true
+  if p.maxPacketsRecv > 0 and s.packetsRecv >= p.maxPacketsRecv:
+    return true
+  if p.maxBytesSent > 0 and s.bytesSent >= p.maxBytesSent:
+    return true
+  if p.maxBytesRecv > 0 and s.bytesRecv >= p.maxBytesRecv:
+    return true
+  if p.seqnoMargin > 0:
+    let remainSend = high(uint32) - s.sendSeq
+    let remainRecv = high(uint32) - s.recvSeq
+    if remainSend <= p.seqnoMargin or remainRecv <= p.seqnoMargin:
+      return true
+  if p.maxSeconds > 0:
+    let now = if nowNanosVal != 0: nowNanosVal else: nowNanos()
+    let elapsedSec = (now - s.lastRekeyNanos) div 1_000_000_000'i64
+    if elapsedSec >= p.maxSeconds:
+      return true
+  return false
+
+proc requestRekey*(s: var SshSession): bool =
+  ## Initiate RFC 4253 §9 re-exchange. Returns false when not in `stOpen`
+  ## or a rekey is already in flight (MUST NOT send a second KEXINIT).
+  ## The KEXINIT itself travels under the old encryption (§9).
+  if s.stage != stOpen or s.rekey != rsIdle:
+    return false
+  s.freshEphemeral()
+  let payload = s.buildLocalKexPayload()
+  s.pendingILocal = payload
+  s.pendingIPeer = @[]
+  s.pendingKexName = ""
+  s.hasPendingKeys = false
+  s.sendNewKeysSent = false
+  s.recvNewKeysGot = false
+  s.sendPayloadInner(payload)
+  s.rekey = rsKexInitSent
+  return true
+
+proc maybeTriggerRekey*(s: var SshSession) =
+  if s.stage == stOpen and s.rekey == rsIdle and s.needsRekey():
+    discard s.requestRekey()
+
+proc setRekeyPolicy*(s: var SshSession, p: RekeyPolicy) =
+  s.policy = p
+
+proc rekeyStats*(s: SshSession): tuple[bytesSent, bytesRecv, packetsSent,
+    packetsRecv: uint64] =
+  (s.bytesSent, s.bytesRecv, s.packetsSent, s.packetsRecv)
+
+proc completeRekeyIfDone(s: var SshSession, events: var seq[SessionEvent]) =
+  ## Both directions switched: adopt pending algorithms, reset accounting,
+  ## flush queued app data (RFC 4253 §9: app data may flow after NEWKEYS),
+  ## stamp `lastRekeyNanos` for the time trigger.
+  if s.rekey == rsIdle or not s.sendNewKeysSent or not s.recvNewKeysGot:
+    return
+  s.cipherC2s = s.pendingCipherC2s
+  s.cipherS2c = s.pendingCipherS2c
+  s.macC2s = s.pendingMacC2s
+  s.macS2c = s.pendingMacS2c
+  s.K = s.pendingK
+  s.H = s.pendingH
+  s.rekey = rsIdle
+  s.hasPendingKeys = false
+  s.pendingILocal = @[]
+  s.pendingIPeer = @[]
+  s.bytesSent = 0
+  s.bytesRecv = 0
+  s.packetsSent = 0
+  s.packetsRecv = 0
+  let n = nowNanos()
+  s.lastRekeyNanos = n
+  s.lastSendNanos = n
+  s.lastRecvNanos = n
+  let queued = s.appQueue
+  s.appQueue = @[]
+  for q in queued:
+    s.sendPayloadInner(q)
+  events.add(SessionEvent(kind: evRekeyDone))
+
+proc sendPayload*(s: var SshSession, payload: openArray[byte]) =
+  ## Public send path. During rekey (RFC 4253 §7.1) application messages
+  ## are queued until NEWKEYS is sent; transport/kex control flows.
+  if payload.len == 0:
+    raise newException(SshSessionError, "ssh session: empty payload")
+  if s.stage == stClosed:
+    raise newException(SshSessionError, "ssh session: connection closed")
+  if s.isRekeying() and not isAllowedDuringRekey(payload[0]):
+    s.appQueue.add(payload.toSeq())
+    return
+  s.sendPayloadInner(payload)
+  s.maybeTriggerRekey()
 
 proc startHandshake*(s: var SshSession) =
   ## Queue version line + KEXINIT. Call once before exchanging bytes.
   s.outbox.add(encodeVersionLine(s.vLocal))
-  var cookie: array[16, byte]
-  let rnd = urandom(16)
-  copyMem(addr cookie[0], unsafeAddr rnd[0], 16)
-  let loc = s.localLists()
-  let payload = buildKexInit(cookie, loc[0], loc[1], loc[2], loc[3], loc[4],
-    loc[5], loc[6], loc[7], loc[8], loc[9])
+  let payload = s.buildLocalKexPayload()
   s.iLocal = payload
-  s.sendPayload(payload)
+  s.sendPayloadInner(payload)
 
 proc sendIgnore*(s: var SshSession, data = "nssh") =
   var w = initWriter()
@@ -259,13 +533,17 @@ proc sendIgnore*(s: var SshSession, data = "nssh") =
 proc sendDisconnect*(s: var SshSession, reason: uint32, message: string) =
   ## Queue a DISCONNECT and mark the session closed for sending. The
   ## connection owner should flush the outbox then close TCP.
+  ## Bypasses the rekey app queue and rekey triggers: DISCONNECT is
+  ## always allowed (RFC 4253 §7.1) and terminates the connection.
   var w = initWriter()
   w.writeByte(MsgDisconnect)
   w.writeUint32(reason)
   w.writeString(message)
   w.writeString("")
-  s.sendPayload(w.toBytes())
+  s.sendPayloadInner(w.toBytes())
   s.stage = stClosed
+  s.rekey = rsIdle
+  s.appQueue = @[]
 
 # ── receive path ────────────────────────────────────────────────────────────
 
@@ -314,7 +592,7 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
                     (uint32(s.inBuf[2]) shl 8) or uint32(s.inBuf[3])
     if packetLen < 12 or packetLen > uint32(MaxSshPacketLen):
       raise newException(SshSessionError, "ssh session: bad CTR packet_length")
-    if int(packetLen) mod specFor(s.cipherKind).blockSize != 0:
+    if int(packetLen) mod specFor(s.keys.fromPeer.cipher.kind).blockSize != 0:
       raise newException(SshSessionError, "ssh session: CTR packet not block aligned")
     let total = 4 + int(packetLen) + macL
     if s.inBuf.len < total:
@@ -341,8 +619,9 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   if packetLen < 12 or packetLen > uint32(MaxSshPacketLen):
     raise newException(SshSessionError, "ssh session: bad CTR packet_length")
   # Length is inside the encrypted region: whole packet must be block
-  # aligned (mirrors OpenSSH's `need % block_size` rejection).
-  if (4 + int(packetLen)) mod specFor(s.cipherKind).blockSize != 0:
+  # aligned (mirrors OpenSSH's `need % block_size` rejection). Block size
+  # is per recv direction so ETM-mixed or asymmetric ciphers decode right.
+  if (4 + int(packetLen)) mod specFor(s.keys.fromPeer.cipher.kind).blockSize != 0:
     raise newException(SshSessionError, "ssh session: CTR packet not block aligned")
   let total = 4 + int(packetLen) + macL
   if s.inBuf.len < total:
@@ -410,16 +689,20 @@ proc pullChachaOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   result = (true, payload)
 
 proc pullOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
-  ## Single packet under the CURRENT cipher state. The caller must handle
-  ## it before pulling again: NEWKEYS flips recvActive mid-buffer.
+  ## Single packet under the CURRENT recv cipher state. The caller must
+  ## handle it before pulling again: NEWKEYS flips recv keys mid-buffer.
+  ## Uses the directional cipher so send/recv can transiently differ
+  ## across NEWKEYS during rekey (RFC 4253 §7.3).
   if not s.recvActive:
     result = s.pullPlaintextOne()
-  elif s.cipherKind == ckAes128Ctr or s.cipherKind == ckAes256Ctr:
-    result = s.pullCtrOne()
-  elif s.cipherKind == ckAes128Gcm or s.cipherKind == ckAes256Gcm:
-    result = s.pullGcmOne()
   else:
-    result = s.pullChachaOne()
+    let rk = s.keys.fromPeer.cipher.kind
+    if rk == ckAes128Ctr or rk == ckAes256Ctr:
+      result = s.pullCtrOne()
+    elif rk == ckAes128Gcm or rk == ckAes256Gcm:
+      result = s.pullGcmOne()
+    else:
+      result = s.pullChachaOne()
 
 # ── KEXDH ───────────────────────────────────────────────────────────────────
 
@@ -429,30 +712,96 @@ proc kexRoles(s: SshSession): tuple[vC, vS: string, initC, initS: seq[byte]] =
   else:
     result = (s.vPeer, s.vLocal, s.iPeer, s.iLocal)
 
+proc rekeyRoles(s: SshSession): tuple[vC, vS: string, initC, initS: seq[byte]] =
+  ## Exchange-hash inputs for a rekey: fresh KEXINIT payloads (RFC 4253 §9
+  ## processes re-exchange identically to initial, only session_id stays).
+  if s.role == rClient:
+    result = (s.vLocal, s.vPeer, s.pendingILocal, s.pendingIPeer)
+  else:
+    result = (s.vPeer, s.vLocal, s.pendingIPeer, s.pendingILocal)
+
 proc activateKeys(s: var SshSession) =
   let sid = if s.hasSessionId: s.sessionId.toSeq() else: s.H.toSeq()
-  s.keys = newSessionKeys(s.K, s.H, sid, s.cipherKind, s.macKind,
-                          s.role == rClient)
+  s.keys = newSessionKeysAsym(s.K, s.H, sid, s.cipherC2s, s.cipherS2c,
+    s.macC2s, s.macS2c, s.role == rClient)
   if not s.hasSessionId:
     s.sessionId = s.H
     s.hasSessionId = true
 
+proc activatePendingKeys(s: var SshSession) =
+  ## Rekey key schedule: session_id MUST remain the first H (RFC 4253
+  ## §7.2/§9); keys/IVs are recomputed from pending K/H + pending algos.
+  let sid = s.sessionId.toSeq()
+  s.pendingKeys = newSessionKeysAsym(s.pendingK, s.pendingH, sid,
+    s.pendingCipherC2s, s.pendingCipherS2c, s.pendingMacC2s,
+    s.pendingMacS2c, s.role == rClient)
+  s.hasPendingKeys = true
+
+proc matchKnownHost(s: SshSession, pubkey: array[32, byte]): bool =
+  for e in s.knownHosts:
+    if e.alg != HostKeyEd25519:
+      continue
+    if e.pubkey != pubkey:
+      continue
+    if e.port != -1 and s.peerPort != 0 and e.port != s.peerPort:
+      continue
+    if e.host.len > 0 and s.peerHost.len > 0 and e.host != s.peerHost:
+      continue
+    return true
+  return false
+
+proc verifyHostKey(s: var SshSession, pubkey: array[32, byte],
+    ksBlob: seq[byte]): bool =
+  ## Client host-key policy shared by initial KEX and rekey (host keys
+  ## MAY change on rekey per §9, so re-verify every time).
+  case s.verifyMode
+  of vmAutoTrust:
+    return true
+  of vmStrict:
+    if s.matchKnownHost(pubkey):
+      return true
+    if s.onHostKey != nil:
+      return s.onHostKey(s.peerHost, s.peerPort, HostKeyEd25519, pubkey)
+    return false
+  of vmTofu:
+    if s.matchKnownHost(pubkey):
+      return true
+    if s.onHostKey != nil:
+      return s.onHostKey(s.peerHost, s.peerPort, HostKeyEd25519, pubkey)
+    # Without a callback/storage hook, fall back to legacy autoTrust flag
+    # so existing tests keep working; real apps should set onHostKey.
+    return s.autoTrust
+
 proc sendNewKeys(s: var SshSession) =
   var n = initWriter()
   n.writeByte(MsgNewKeys)
-  s.sendPayload(n.toBytes())
-  s.sendActive = true
+  # NEWKEYS travels under the OLD keys (§7.3); the switch happens after.
+  s.sendPayloadInner(n.toBytes())
+  if s.stage == stOpen:
+    # Rekey path: flip the send direction to pending keys now. All
+    # messages sent after this MUST use the new keys (§7.3).
+    if not s.hasPendingKeys:
+      raise newException(SshSessionError, "ssh session: NEWKEYS with no pending keys")
+    s.keys.toPeer = s.pendingKeys.toPeer
+    s.sendNewKeysSent = true
+    s.rekey = rsNewKeysSent
+  else:
+    s.sendActive = true
 
-proc handleKexDhInit(s: var SshSession, payload: openArray[byte]) =
+proc handleKexDhInit(s: var SshSession, payload: openArray[byte],
+    events: var seq[SessionEvent]) =
   ## Server side: peer key -> H, sign, reply + NEWKEYS. Branches on kex.
   if not s.hasHostKey:
     raise newException(SshSessionError, "ssh session: server has no host key")
-  let (vC, vS, initC, initS) = kexRoles(s)
+  let isRekey = s.stage == stOpen
+  let (vC, vS, initC, initS) =
+    if isRekey: s.rekeyRoles() else: s.kexRoles()
+  let kexName = if isRekey: s.pendingKexName else: s.kexName
   let ksBlob = encodePubBlob(s.hostKey.pubkey)
   var w = initWriter()
   w.writeByte(MsgKexDhReply)
   w.writeString(ksBlob)
-  if s.kexName == KexGroup14Sha256:
+  if kexName == KexGroup14Sha256:
     var r = initReader(payload)
     discard r.readByte()
     let eRaw = r.readMpint()
@@ -463,9 +812,15 @@ proc handleKexDhInit(s: var SshSession, payload: openArray[byte]) =
     let shared = dhShared(e, s.dhPriv, prime)
     let f = dhPublic(s.dhPriv, prime)
     let H = dhExchangeHash(vC, vS, initC, initS, ksBlob, e, f, shared)
-    s.K = shared
-    s.H = H
-    s.activateKeys()
+    if isRekey:
+      s.pendingK = shared
+      s.pendingH = H
+      s.hasPendingH = true
+      s.activatePendingKeys()
+    else:
+      s.K = shared
+      s.H = H
+      s.activateKeys()
     w.writeMpint(f)
   else:
     var r = initReader(payload)
@@ -477,27 +832,42 @@ proc handleKexDhInit(s: var SshSession, payload: openArray[byte]) =
     let shared = x25519SharedMpint(s.ephLocal.priv, s.ephPeer)
     let H = curve25519ExchangeHash(vC, vS, initC, initS, ksBlob,
       s.ephPeer, s.ephLocal.pub, shared)
-    s.K = shared
-    s.H = H
-    s.activateKeys()
+    if isRekey:
+      s.pendingK = shared
+      s.pendingH = H
+      s.hasPendingH = true
+      s.activatePendingKeys()
+    else:
+      s.K = shared
+      s.H = H
+      s.activateKeys()
     w.writeString(s.ephLocal.pub)
-  let sig = edSign(s.hostKey, s.H)
+  let sigH = if isRekey: s.pendingH else: s.H
+  let sig = edSign(s.hostKey, sigH)
   w.writeString(encodeSignature(sig))
-  s.sendPayload(w.toBytes())
+  s.sendPayloadInner(w.toBytes())
   s.sendNewKeys()
-  s.stage = stNewKeys
+  if isRekey:
+    s.rekey = rsNewKeysSent
+    s.completeRekeyIfDone(events)
+  else:
+    s.stage = stNewKeys
 
-proc handleKexDhReply(s: var SshSession, payload: openArray[byte]) =
+proc handleKexDhReply(s: var SshSession, payload: openArray[byte],
+    events: var seq[SessionEvent]) =
   ## Client side: verify hostkey + signature, send NEWKEYS. Branches on kex.
   var r = initReader(payload)
   if r.readByte() != MsgKexDhReply:
     raise newException(SshSessionError, "ssh session: not a KEXDH_REPLY")
   let ksBlob = r.readString()
   let pub = parsePubBlob(ksBlob)
-  if not s.autoTrust:
+  if not s.verifyHostKey(pub, ksBlob):
     raise newException(SshSessionError, "ssh session: untrusted host key")
-  let (vC, vS, initC, initS) = kexRoles(s)
-  if s.kexName == KexGroup14Sha256:
+  let isRekey = s.stage == stOpen
+  let (vC, vS, initC, initS) =
+    if isRekey: s.rekeyRoles() else: s.kexRoles()
+  let kexName = if isRekey: s.pendingKexName else: s.kexName
+  if kexName == KexGroup14Sha256:
     let fRaw = r.readMpint()
     let sigBlob = r.readString()
     if not r.isExhausted():
@@ -510,8 +880,14 @@ proc handleKexDhReply(s: var SshSession, payload: openArray[byte]) =
     let sig = parseSignature(sigBlob)
     if not edVerify(pub, H, sig):
       raise newException(SshSessionError, "ssh session: host signature invalid")
-    s.K = shared
-    s.H = H
+    if isRekey:
+      s.pendingK = shared
+      s.pendingH = H
+      s.hasPendingH = true
+      s.activatePendingKeys()
+    else:
+      s.K = shared
+      s.H = H
   else:
     let qS = r.readString()
     let sigBlob = r.readString()
@@ -526,13 +902,77 @@ proc handleKexDhReply(s: var SshSession, payload: openArray[byte]) =
     let sig = parseSignature(sigBlob)
     if not edVerify(pub, H, sig):
       raise newException(SshSessionError, "ssh session: host signature invalid")
-    s.K = shared
-    s.H = H
-  s.activateKeys()
+    if isRekey:
+      s.pendingK = shared
+      s.pendingH = H
+      s.hasPendingH = true
+      s.activatePendingKeys()
+    else:
+      s.K = shared
+      s.H = H
+  if not isRekey:
+    s.activateKeys()
   s.sendNewKeys()
-  s.stage = stNewKeys
+  if isRekey:
+    s.rekey = rsNewKeysSent
+    s.completeRekeyIfDone(events)
+  else:
+    s.stage = stNewKeys
 
 # ── message dispatch ────────────────────────────────────────────────────────
+
+proc negotiatePending(s: var SshSession, peerPayload: openArray[byte]) =
+  ## Fill pending* algorithm selections from fresh KEXINIT pair.
+  ## Client preference wins on both sides (RFC 4253 §7.1).
+  s.pendingIPeer = peerPayload.toSeq()
+  let peer = parseKexInit(peerPayload)
+  var locR = initReader(s.pendingILocal)
+  discard locR.readByte()
+  discard locR.readRaw(16)
+  var loc: array[10, seq[string]]
+  for i in 0 ..< 10:
+    loc[i] = locR.readNameList()
+  let (cLists, svLists) =
+    if s.role == rClient: (loc, peer) else: (peer, loc)
+  let sel = selectAlgorithms(cLists, svLists)
+  s.pendingKexName = sel.kex
+  s.pendingHostKeyName = sel.hostkey
+  s.pendingCipherC2s = parseCipherKind(sel.cipherC2s)
+  s.pendingCipherS2c = parseCipherKind(sel.cipherS2c)
+  s.pendingMacC2s = parseMacKind(sel.macC2s)
+  s.pendingMacS2c = parseMacKind(sel.macS2c)
+
+proc handleRekeyKexInit(s: var SshSession, payload: openArray[byte],
+    events: var seq[SessionEvent]) =
+  ## RFC 4253 §9: KEXINIT in stOpen starts/responds to re-exchange.
+  ## Uses current encryption (payload arrived under old keys); new keys
+  ## take effect only at NEWKEYS (§7.3). Never changes roles.
+  if s.rekey == rsIdle:
+    # Peer-initiated: MUST reply with our own KEXINIT (§9), fresh secrets.
+    s.freshEphemeral()
+    s.pendingILocal = s.buildLocalKexPayload()
+    s.sendPayloadInner(s.pendingILocal)
+    s.rekey = rsKexInitSent
+    s.sendNewKeysSent = false
+    s.recvNewKeysGot = false
+    s.hasPendingKeys = false
+    s.negotiatePending(payload)
+  else:
+    # We already sent KEXINIT: this packet IS the reply (§9 "except when
+    # the received KEXINIT already was a reply"). Do not send another.
+    if s.pendingIPeer.len > 0:
+      raise newException(SshSessionError, "ssh session: duplicate KEXINIT during rekey")
+    s.negotiatePending(payload)
+  # KEXINIT exchange complete on this side: client speaks first (§8).
+  if s.role == rClient:
+    var w = initWriter()
+    w.writeByte(MsgKexDhInit)
+    if s.pendingKexName == KexGroup14Sha256:
+      w.writeMpint(dhPublic(s.dhPriv, group14Prime()))
+    else:
+      w.writeString(s.ephLocal.pub)
+    s.sendPayloadInner(w.toBytes())
+    s.rekey = rsKexDh
 
 proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEvent] =
   result = @[]
@@ -541,13 +981,7 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
   case payload[0]
   of MsgKexInit:
     if s.stage == stOpen:
-      # MVP has no rekey support: refuse cleanly with DISCONNECT carrying
-      # the reason instead of a bare protocol error, so the peer (and our
-      # logs) show why the connection is going down.
-      s.sendDisconnect(DisconnectKeyExchangeFailed,
-        "ssh session: rekey not supported")
-      result.add(SessionEvent(kind: evDisconnect,
-        message: "ssh session: rekey not supported"))
+      s.handleRekeyKexInit(payload, result)
       return
     if s.stage != stKexInit:
       raise newException(SshSessionError, "ssh session: unexpected KEXINIT")
@@ -558,22 +992,13 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
     # sides compute identical selections (client preference order wins).
     let (cLists, svLists) =
       if s.role == rClient: (loc, peer) else: (peer, loc)
-    s.kexName = pickFirst(cLists[0], svLists[0])
-    s.hostKeyName = pickFirst(cLists[1], svLists[1])
-    if s.kexName != KexCurve25519Sha256 and s.kexName != KexGroup14Sha256:
-      raise newException(SshSessionError, "ssh session: unsupported kex " & s.kexName)
-    if s.hostKeyName != HostKeyEd25519:
-      raise newException(SshSessionError, "ssh session: unsupported hostkey")
-    let c2s = pickFirst(cLists[2], svLists[2])
-    let s2c = pickFirst(cLists[3], svLists[3])
-    if c2s != s2c:
-      raise newException(SshSessionError, "ssh session: asymmetric ciphers unsupported")
-    s.cipherKind = parseCipherKind(c2s)
-    let mC2s = pickFirst(cLists[4], svLists[4])
-    let mS2c = pickFirst(cLists[5], svLists[5])
-    if mC2s != mS2c:
-      raise newException(SshSessionError, "ssh session: asymmetric MACs unsupported")
-    s.macKind = parseMacKind(mC2s)
+    let sel = selectAlgorithms(cLists, svLists)
+    s.kexName = sel.kex
+    s.hostKeyName = sel.hostkey
+    s.cipherC2s = parseCipherKind(sel.cipherC2s)
+    s.cipherS2c = parseCipherKind(sel.cipherS2c)
+    s.macC2s = parseMacKind(sel.macC2s)
+    s.macS2c = parseMacKind(sel.macS2c)
     if s.role == rClient:
       var w = initWriter()
       w.writeByte(MsgKexDhInit)
@@ -584,19 +1009,40 @@ proc handleMessage(s: var SshSession, payload: openArray[byte]): seq[SessionEven
       s.sendPayload(w.toBytes())
     s.stage = stKexDh
   of MsgKexDhInit:
+    if s.stage == stOpen:
+      if s.role != rServer or not s.isRekeying():
+        raise newException(SshSessionError, "ssh session: unexpected KEXDH_INIT")
+      s.handleKexDhInit(payload, result)
+      return
     if s.role != rServer or s.stage != stKexDh:
       raise newException(SshSessionError, "ssh session: unexpected KEXDH_INIT")
-    s.handleKexDhInit(payload)
+    s.handleKexDhInit(payload, result)
   of MsgKexDhReply:
+    if s.stage == stOpen:
+      if s.role != rClient or not s.isRekeying():
+        raise newException(SshSessionError, "ssh session: unexpected KEXDH_REPLY")
+      s.handleKexDhReply(payload, result)
+      return
     if s.role != rClient or s.stage != stKexDh:
       raise newException(SshSessionError, "ssh session: unexpected KEXDH_REPLY")
-    s.handleKexDhReply(payload)
+    s.handleKexDhReply(payload, result)
   of MsgNewKeys:
     if payload.len != 1:
       raise newException(SshSessionError, "ssh session: NEWKEYS with payload")
+    if s.stage == stOpen:
+      # Rekey NEWKEYS arrived under OLD keys (§7.3); flip recv direction
+      # to pending keys now. Send direction flips when we sent NEWKEYS.
+      if not s.isRekeying() or not s.hasPendingKeys:
+        raise newException(SshSessionError, "ssh session: unexpected NEWKEYS")
+      s.keys.fromPeer = s.pendingKeys.fromPeer
+      s.recvActive = true
+      s.recvNewKeysGot = true
+      s.completeRekeyIfDone(result)
+      return
     s.recvActive = true
     if s.sendActive and s.recvActive and s.stage == stNewKeys:
       s.stage = stOpen
+      s.lastRekeyNanos = nowNanos()
       result.add(SessionEvent(kind: evReady))
   of MsgDisconnect:
     var reason = 0'u32
@@ -623,6 +1069,7 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
   ## Peer-triggered failures become evErrorMsg events, never exceptions.
   ## The reassembly buffer is capped: a peer that never completes a line
   ## or packet is cut off instead of growing memory without bound.
+  ## Wire bytes count toward the rekey volume triggers (RFC 4253 §9).
   const MaxSessionBuffer = 262144
   result = @[]
   if chunk.len > 0:
@@ -634,6 +1081,8 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
     let off = s.inBuf.len
     s.inBuf.setLen(off + chunk.len)
     copyMem(addr s.inBuf[off], unsafeAddr chunk[0], chunk.len)
+    s.bytesRecv += uint64(chunk.len)
+    s.lastRecvNanos = nowNanos()
   if s.stage == stVersion:
     let n = findVersionLine(s.inBuf)
     if n == 0:
@@ -652,6 +1101,7 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
       let (found, p) = s.pullOne()
       if not found:
         break
+      inc s.packetsRecv
       # pullOne consumed exactly one packet and advanced recvSeq, so the
       # packet now in handleMessage has this sequence number. Stamp it on
       # every event so upper layers can reference it (UNIMPLEMENTED).
@@ -660,6 +1110,57 @@ proc receiveBytes*(s: var SshSession, chunk: openArray[byte]): seq[SessionEvent]
       for i in 0 ..< evs.len:
         evs[i].seqno = pseq
         result.add(evs[i])
+      # In-flight app data during rekey still counts; trigger our own
+      # rekey after processing (never inside handleMessage mid-burst).
+      if s.stage == stOpen and s.rekey == rsIdle and s.needsRekey():
+        discard s.requestRekey()
   except ValueError as e:
     s.stage = stClosed
     result.add(SessionEvent(kind: evErrorMsg, message: e.msg))
+
+# ── keepalive (opt-in IGNORE timer + idle timeout) ──────────────────────────
+
+proc setKeepalive*(s: var SshSession, intervalMs = 0, idleTimeoutMs = 0,
+    payload = "nssh") =
+  ## `intervalMs > 0` sends IGNORE when idle that long; `idleTimeoutMs > 0`
+  ## disconnects when no inbound packet arrives within the window.
+  s.keepaliveIntervalMs = intervalMs
+  s.idleTimeoutMs = idleTimeoutMs
+  if payload.len > 0:
+    s.keepalivePayload = payload
+  let n = nowNanos()
+  s.lastSendNanos = n
+  s.lastRecvNanos = n
+
+proc pollKeepalive*(s: var SshSession, nowNanosVal = 0'i64): seq[SessionEvent] =
+  ## Drive keepalive timers. Call from `client`/`server` poll loops and
+  ## long-running tests. Emits `evDisconnect` on idle timeout.
+  result = @[]
+  if s.stage != stOpen:
+    return
+  let now = if nowNanosVal != 0: nowNanosVal else: nowNanos()
+  if s.idleTimeoutMs > 0:
+    let idleMs = (now - s.lastRecvNanos) div 1_000_000'i64
+    if idleMs >= int64(s.idleTimeoutMs):
+      var w = initWriter()
+      w.writeByte(MsgDisconnect)
+      w.writeUint32(DisconnectByApplication)
+      w.writeString("idle timeout")
+      w.writeString("")
+      # Bypass the app queue: DISCONNECT is always allowed (§7.1).
+      s.sendPayloadInner(w.toBytes())
+      s.stage = stClosed
+      result.add(SessionEvent(kind: evDisconnect,
+        message: "idle timeout"))
+      return
+  if s.keepaliveIntervalMs > 0:
+    let sinceSendMs = (now - s.lastSendNanos) div 1_000_000'i64
+    if sinceSendMs >= int64(s.keepaliveIntervalMs):
+      # IGNORE is allowed during rekey and doubles as a liveness probe.
+      var w = initWriter()
+      w.writeByte(MsgIgnore)
+      w.writeString(s.keepalivePayload)
+      if s.isRekeying():
+        s.sendPayloadInner(w.toBytes())
+      else:
+        s.sendPayload(w.toBytes())

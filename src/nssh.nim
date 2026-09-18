@@ -4,8 +4,11 @@ import nssh/kex
 import nssh/ciphers
 import nssh/hostkeys
 import nssh/session
+import nssh/knownhosts
 import nssh/auth
 import nssh/channel
+import nssh/sftp
+import nssh/sftp_match
 import nssh/wire
 import nssh/client
 import nssh/server
@@ -16,8 +19,11 @@ export kex
 export ciphers
 export hostkeys
 export session
+export knownhosts
 export auth
 export channel
+export sftp
+export sftp_match
 export wire
 export client
 export server
