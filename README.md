@@ -1,5 +1,5 @@
 <p align="center">
-  NSSH - Pure Nim SSH client and server<br>
+  NSSH &mdash; Pure 👑 Nim SSH client and server<br>
   Built on top of <a href="https://github.com/openpeeps/powpow">PowPow event library</a>
 </p>
 
@@ -18,6 +18,12 @@
 > from [`powpow`](https://github.com/openpeeps/powpow), crypto from
 > [`nimcypher`](https://github.com/nimbase/nimcypher). Modern algorithms
 > only. **Experimental software!**
+
+## Key Features
+
+- Pure Nim, no C dependencies, no OpenSSL
+- Server and client built on top of the PowPow event library, each owning its event loop
+- Buffer-view chunking (`openArray`) at API boundaries with single-pass framing, so large transfers stream instead of piling up in memory
 
 ## What you get
 
@@ -40,6 +46,10 @@ Sequence numbers refuse to wrap instead of silently overflowing. Host
 keys verify against `known_hosts` (strict or trust-on-first-use).
 Unknown message types get proper `UNIMPLEMENTED` replies.
 
+
+## Key features
+- 
+
 ## Supported algorithms
 
 - Key exchange: `curve25519-sha256`, `diffie-hellman-group14-sha256`
@@ -56,6 +66,56 @@ Deliberately missing: legacy ciphers and MACs, RSA/ECDSA host keys,
 choice, not a gap.
 
 ## Examples
+
+### Create an SSH server
+
+The skeleton every server builds on: generate a host key, create the
+server, track one state machine per connection, and drive the loop.
+This one completes the handshake and accepts any key, then logs what
+happens. It opens no channels yet.
+
+```nim
+import std/tables
+import nssh/server
+import nssh/auth
+import nssh/hostkeys
+
+type Conn = ref object
+  auth: AuthServer
+
+var conns = initTable[pointer, Conn]()
+let hk = generateEdKey()
+var srv: SshServer
+srv = newSshServer(hk, "127.0.0.1", 2222,
+  onReady = proc(c: ServerConn) =
+    echo "new connection"
+    conns[cast[pointer](c)] = Conn(
+      auth: initAuthServer(c.session.sessionId,
+        checkKey = proc(u, alg: string, blob: seq[byte]): bool {.closure.} =
+          true))
+  ,
+  onPacket = proc(c: ServerConn, m: byte, p: seq[byte], q: uint32) =
+    let app = conns.getOrDefault(cast[pointer](c))
+    if app == nil: return
+    if m < 80:
+      let ev = app.auth.authFeed(p, q)
+      if ev.kind == asSuccess:
+        echo "authenticated as ", ev.user
+      for q2 in app.auth.takeOutbox():
+        srv.sendRaw(c, q2)
+    else:
+      discard # channel traffic: see the next example
+  ,
+  onClose = proc(c: ServerConn) =
+    echo "connection closed"
+    conns.del(cast[pointer](c))
+)
+srv.run()
+```
+
+Point system ssh at it (`ssh -p 2222 user@127.0.0.1`, any key works
+here) and watch the log: the handshake and authentication complete.
+The next example answers channels so commands actually run.
 
 ### Run a command over SSH (server side)
 
