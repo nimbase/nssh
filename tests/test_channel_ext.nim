@@ -130,3 +130,36 @@ test "half-close handshake: EOF answered with EOF+CLOSE":
   check done.len == 1
   check done[0].kind == cevClose
   check sm.takeOutbox().len == 0 # no duplicate CLOSE
+
+test "shut window stashes, WINDOW_ADJUST resumes with no loss":
+  # 2.5 MB through a 1 MB window: the overflow must be stashed, not
+  # dropped, and must arrive byte-identical once the peer reopens the
+  # window (this is what SFTP bulk download relies on).
+  var (cm, sm, cliId, srvId) = openPair()
+  var blob = newSeq[byte](2_500_000)
+  for i in 0 ..< blob.len:
+    blob[i] = byte(i and 0xFF)
+  check cm.sendData(cliId, blob) == blob.len # accepted, not all framed
+  check cm.channels[cliId].pendingSend.len > 0 # overflow stashed
+  var got: seq[byte] = @[]
+  var sawAdjust = false
+  for _ in 0 ..< 400:
+    for ev in deliver(cm, sm):
+      if ev.kind == cevData:
+        got.add(ev.data)
+    for ev in deliver(sm, cm): # receiver's auto-adjusts reopen us
+      if ev.kind == cevWindowAdjust:
+        sawAdjust = true
+    if got.len == blob.len and cm.channels[cliId].pendingSend.len == 0 and
+        sm.takeOutbox().len == 0 and cm.takeOutbox().len == 0:
+      break
+  check sawAdjust
+  check got == blob
+
+test "stash cap fails fast instead of growing forever":
+  var (cm, sm, cliId, srvId) = openPair()
+  var huge = newSeq[byte](MaxPendingSend + 2_000_000)
+  expect SshChannelError:
+    discard cm.sendData(cliId, huge)
+  # window still shut, stash holds at most the cap
+  check cm.channels[cliId].pendingSend.len <= MaxPendingSend

@@ -23,7 +23,8 @@
 
 - Pure Nim, no C dependencies, no OpenSSL
 - Server and client built on top of the PowPow event library, each owning its event loop
-- Buffer-view chunking (`openArray`) at API boundaries with single-pass framing, so large transfers stream instead of piling up in memory
+- Memory-flat transfers: single-buffer packet crypto, bounded per-channel send stash,<br>
+  streaming SFTP uploads and downloads (bench: 64 MB at ~100 MB/s under 4 MB peak RSS)
 
 ## What you get
 
@@ -443,7 +444,7 @@ The bundled `OsBackend` serves a local folder (escapes rejected),
 `ReadOnlyBackend` wraps any backend, and `denyTypes` blocks specific
 requests (the `sftp-server -P` equivalent).
 
-### Two things that bite
+### Things that bite
 
 1. **Subsystem requests need an explicit answer.** Nothing is
    auto-accepted: every `cevSubsystem` must get a
@@ -452,6 +453,14 @@ requests (the `sftp-server -P` equivalent).
    handshake (RFC 4254 section 5.3): it sends EOF and waits for our
    EOF plus CLOSE before sending its own CLOSE. Answer `cevEof` with
    `sendEof` + `sendClose`.
+3. **Bulk senders pace on `cevWindowAdjust`.** `sendData` accepts
+   everything at once: what fits the peer window frames immediately,
+   the rest waits in a per-channel stash and flushes on the next
+   adjust. The stash is capped (`MaxPendingSend`, 4 MB) and raises
+   instead of growing forever, so if you stream bulk data, watch for
+   `cevWindowAdjust` (its `status` is the granted bytes) and slow
+   down. Drain before EOF: `sendEof` flushes best-effort, but bytes
+   still stashed behind a shut window would land after it.
 
 ## Testing
 
@@ -517,13 +526,19 @@ gracefully when OpenSSH is missing. `examples/sftp_loopback.nim` and
 - [x] Typed algorithm offers with forcing for constrained peers and tests
 - [x] 15 test suites covering handshake, ciphers, auth, channels, rekeying, keepalive, SFTP, and Match rules
 - [x] OpenSSH interop both ways: system ssh against our server, our client against sshd, system sftp against our server
-- [x] Offline loopback examples for exec and sftp (no sockets)
+- [x] Offline loopback examples for exec and sftp (no sockets), plus an SFTP throughput bench
 - [x] README with working examples, CHANGELOG, LICENSE
-- [ ] Throughput benchmarks and a CTR/GCM performance pass
+- [x] Memory-flat bulk transfer: bounded send stash, window re-grant, single-buffer CTR crypto, SFTP throughput bench
+- [ ] GCM/chacha single-buffer pass (needs allocator-aware nimcypher APIs)
+- [ ] Throughput benchmarks across all ciphers
 - [ ] CI running the full suite
 - [ ] 0.2.0 release
 
 Legacy algorithms (CBC, 3DES, SHA-1 MACs) stay out on purpose.
+
+### References
+- https://www.sftp.net/specification
+- https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02
 
 ### 🎩 License
 MIT license

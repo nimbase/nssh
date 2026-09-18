@@ -38,6 +38,31 @@ test "aes-ctr stateful round trip across split calls":
   expect SshCipherError: # unaligned chunk rejected
     discard e.ctrCrypt(@[1'u8, 2'u8])
 
+test "ctrCryptInPlace matches ctrCrypt and round-trips":
+  let key = hx("2b7e151628aed2a6abf7158809cf4f3c")
+  let iv = hx("000102030405060708090a0b0c0d0e0f")
+  let pt = hx("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45ef059c")
+  var e1 = initCipher(ckAes128Ctr, key, iv)
+  var e2 = initCipher(ckAes128Ctr, key, iv)
+  let expectCt = e1.ctrCrypt(pt)
+  var buf = pt
+  e2.ctrCryptInPlace(buf.toOpenArray(0, buf.high))
+  check buf == expectCt
+  # decrypt in place back to plaintext (CTR is symmetric)
+  var d = initCipher(ckAes128Ctr, key, iv)
+  d.ctrCryptInPlace(buf.toOpenArray(0, buf.high))
+  check buf == pt
+  # known vector in place
+  var v = initCipher(ckAes128Ctr,
+    hx("2b7e151628aed2a6abf7158809cf4f3c"),
+    hx("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"))
+  var blk = hx("6bc1bee22e409f96e93d7e117393172a")
+  v.ctrCryptInPlace(blk.toOpenArray(0, blk.high))
+  check blk == hx("874d6191b620e3261bef6864990db6ce")
+  expect SshCipherError:
+    var bad = @[1'u8, 2'u8]
+    v.ctrCryptInPlace(bad.toOpenArray(0, bad.high))
+
 test "aes128-gcm seal/open round trip + tamper + counter":
   let key = hx("2b7e151628aed2a6abf7158809cf4f3c")
   let iv = hx("000102030405060708090a0b")

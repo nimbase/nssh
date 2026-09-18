@@ -105,8 +105,11 @@ proc matchRule*(rules: openArray[MatchRule], id: Identity): MatchRule =
   raise e
 
 proc backendFor*(rule: MatchRule, id: Identity): SftpBackend =
-  ## Build the sandboxed backend for a matched rule.
-  let b = newOsBackend(expandRoot(rule.root, id), rule.umask)
+  ## Build the sandboxed backend for a matched rule. Relative client
+  ## paths resolve against root/startDir; an escaping startDir fails
+  ## fast here (from newOsBackend) instead of serving anything.
+  let b = newOsBackend(expandRoot(rule.root, id), rule.umask,
+    rule.startDir)
   if rule.readOnly:
     result = newReadOnlyBackend(b)
   else:

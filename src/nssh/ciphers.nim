@@ -128,6 +128,20 @@ proc ctrCrypt*(c: var SshCipher, data: openArray[byte]): seq[byte] =
     cast[ptr UncheckedArray[byte]](addr result[0]),
     cast[ptr UncheckedArray[byte]](unsafeAddr data[0]), data.len)
 
+proc ctrCryptInPlace*(c: var SshCipher, data: var openArray[byte]) =
+  ## Same op as ctrCrypt but XORs the keystream directly into `data`
+  ## (no allocation). Safe: the primitive reads each byte before
+  ## writing it. Same 16-byte alignment requirement.
+  if c.kind != ckAes128Ctr and c.kind != ckAes256Ctr:
+    raise newException(SshCipherError, "ssh cipher: not a CTR cipher")
+  if data.len mod 16 != 0:
+    raise newException(SshCipherError, "ssh cipher: CTR chunks must be 16-byte aligned")
+  if data.len == 0:
+    return
+  aesAlgo.ctrXorInto(c.aesCtx, c.ctr,
+    cast[ptr UncheckedArray[byte]](addr data[0]),
+    cast[ptr UncheckedArray[byte]](addr data[0]), data.len)
+
 # ── AES-GCM (RFC 5647: clear length as AAD, 4B salt + u64 counter nonce) ────
 
 proc incGcmNonce(c: var SshCipher) =

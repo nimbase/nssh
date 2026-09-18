@@ -42,6 +42,12 @@ const
   DefaultWindow* = 1_048_576'u32
   DefaultMaxPacket* = 32_768'u32
 
+  # Cap on bytes stashed per channel while the peer's window is shut.
+  # sendData auto-queues overflow instead of dropping it, so without a
+  # bound a stalled peer means unbounded growth. Bulk senders should
+  # pace on cevWindowAdjust instead of leaning on this.
+  MaxPendingSend* = 4 * 1024 * 1024
+
 type
   SshChannelError* = object of ValueError
 
@@ -56,6 +62,9 @@ type
     localMaxPkt*: uint32
     remoteWindow*: uint32  ## how much we may still send
     remoteMaxPkt*: uint32
+    pendingSend*: seq[byte] ## accepted but unframed (window shut)
+    pendingExt*: seq[byte]  ## same, for extended (stderr) data
+    pendingExtType*: uint32 ## dataType tag for the extended stash
     state*: ChanState
     eofSent*: bool
     closeSent*: bool
@@ -63,7 +72,7 @@ type
   ChanEventKind* = enum
     cevOpened, cevOpenFailure, cevData, cevExtendedData, cevEof, cevClose,
     cevExec, cevShell, cevEnv, cevPty, cevExitStatus, cevExitSignal,
-    cevWindowChange, cevSignal, cevSubsystem,
+    cevWindowChange, cevSignal, cevSubsystem, cevWindowAdjust,
     cevRequestOk, cevRequestFail, cevGlobalRequest
 
   ChanEvent* = object
@@ -189,54 +198,141 @@ proc sendExitStatus*(m: var ChannelMux, id: uint32, status: uint32) =
   m.sendRequest(id, "exit-status", false, proc(w: var Writer) {.closure.} =
     w.writeUint32(status))
 
-proc sendData*(m: var ChannelMux, id: uint32, data: openArray[byte]): int =
-  ## Queue DATA frames honoring remote window + max packet. Returns bytes
-  ## queued; if less than data.len, retry the remainder after WINDOW_ADJUST.
-  var c = m.get(id)
-  if c.state != chOpen and c.state != chEofReceived:
-    raise newException(SshChannelError, "ssh channel: not open")
-  var off = 0
-  while off < data.len and c.remoteWindow > 0:
-    let take = min(min(data.len - off, int(c.remoteWindow)),
+proc frameData(m: var ChannelMux, c: var Channel, data: openArray[byte],
+    first: var int, extended = false, dataType = 0'u32) =
+  ## Frame as much of data[first..^1] as window + max packet allow.
+  ## Advances `first`; the caller stashes the remainder.
+  while first < data.len and c.remoteWindow > 0:
+    let take = min(min(data.len - first, int(c.remoteWindow)),
                    int(c.remoteMaxPkt))
     if take <= 0:
       break
     var w = initWriter()
-    w.writeByte(MsgChannelData)
-    w.writeUint32(c.remoteId)
-    w.writeString(data.toOpenArray(off, off + take - 1))
+    if extended:
+      w.writeByte(MsgChannelExtendedData)
+      w.writeUint32(c.remoteId)
+      w.writeUint32(dataType)
+    else:
+      w.writeByte(MsgChannelData)
+      w.writeUint32(c.remoteId)
+    w.writeString(data.toOpenArray(first, first + take - 1))
     m.outbox.add(w.toBytes())
     c.remoteWindow -= uint32(take)
-    off += take
+    first += take
+
+proc stash(m: var ChannelMux, c: var Channel, id: uint32,
+    data: openArray[byte], first: int) =
+  ## Stash unframed tail so no byte is ever dropped. Bounded: a peer
+  ## that never reopens its window fails fast instead of growing us.
+  if first < data.len:
+    if c.pendingSend.len + (data.len - first) > MaxPendingSend:
+      raise newException(SshChannelError,
+        "ssh channel: send stash full, peer window shut")
+    let off = c.pendingSend.len
+    c.pendingSend.setLen(off + (data.len - first))
+    copyMem(addr c.pendingSend[off], unsafeAddr data[first],
+      data.len - first)
   m.channels[id] = c
-  result = off
+
+proc sendData*(m: var ChannelMux, id: uint32, data: openArray[byte]): int =
+  ## Queue all of `data` (framing what the window allows now, stashing
+  ## the rest) and return data.len. Stashed bytes flush automatically on
+  ## WINDOW_ADJUST; bulk senders should still pace on cevWindowAdjust
+  ## instead of outrunning the peer. Raises if the stash would exceed
+  ## MaxPendingSend.
+  var c = m.get(id)
+  if c.state != chOpen and c.state != chEofReceived:
+    raise newException(SshChannelError, "ssh channel: not open")
+  if c.pendingSend.len > 0:
+    # Older bytes first: everything joins the stash, then it drains.
+    if data.len > 0:
+      if c.pendingSend.len + data.len > MaxPendingSend:
+        raise newException(SshChannelError,
+          "ssh channel: send stash full, peer window shut")
+      let off = c.pendingSend.len
+      c.pendingSend.setLen(off + data.len)
+      copyMem(addr c.pendingSend[off], unsafeAddr data[0], data.len)
+    var first = 0
+    m.frameData(c, c.pendingSend.toOpenArray(0, c.pendingSend.high), first)
+    if first >= c.pendingSend.len:
+      c.pendingSend.setLen(0)
+    elif first > 0:
+      let left = c.pendingSend.len - first
+      copyMem(addr c.pendingSend[0], addr c.pendingSend[first], left)
+      c.pendingSend.setLen(left)
+    m.channels[id] = c
+    return data.len
+  var first = 0
+  m.frameData(c, data, first)
+  m.stash(c, id, data, first)
+  result = data.len
+
+proc flushPending(m: var ChannelMux, c: var Channel, id: uint32) =
+  ## Frame stashed bytes after the window reopened. No-op when empty.
+  ## Normal and extended stashes are independent streams, so each keeps
+  ## its own framing (and its own tag).
+  if c.pendingSend.len > 0:
+    var first = 0
+    m.frameData(c, c.pendingSend.toOpenArray(0, c.pendingSend.high), first)
+    if first >= c.pendingSend.len:
+      c.pendingSend.setLen(0) # keep capacity for reuse
+    elif first > 0:
+      let left = c.pendingSend.len - first
+      copyMem(addr c.pendingSend[0], addr c.pendingSend[first], left)
+      c.pendingSend.setLen(left)
+  if c.pendingExt.len > 0:
+    var first = 0
+    m.frameData(c, c.pendingExt.toOpenArray(0, c.pendingExt.high), first,
+      extended = true, dataType = c.pendingExtType)
+    if first >= c.pendingExt.len:
+      c.pendingExt.setLen(0)
+    elif first > 0:
+      let left = c.pendingExt.len - first
+      copyMem(addr c.pendingExt[0], addr c.pendingExt[first], left)
+      c.pendingExt.setLen(left)
+  m.channels[id] = c
 
 proc sendExtendedData*(m: var ChannelMux, id: uint32, dataType: uint32,
-                       data: openArray[byte]): int =
+                        data: openArray[byte]): int =
+  ## Same queue-all contract as sendData, for extended (stderr) data.
+  ## Uses its own stash so the dataType tag survives a shut window.
   var c = m.get(id)
   if c.state != chOpen and c.state != chEofReceived:
     raise newException(SshChannelError, "ssh channel: not open")
-  var off = 0
-  while off < data.len and c.remoteWindow > 0:
-    let take = min(min(data.len - off, int(c.remoteWindow)),
-                   int(c.remoteMaxPkt))
-    if take <= 0:
-      break
-    var w = initWriter()
-    w.writeByte(MsgChannelExtendedData)
-    w.writeUint32(c.remoteId)
-    w.writeUint32(dataType)
-    w.writeString(data.toOpenArray(off, off + take - 1))
-    m.outbox.add(w.toBytes())
-    c.remoteWindow -= uint32(take)
-    off += take
+  if c.pendingExt.len > 0:
+    if dataType != c.pendingExtType:
+      raise newException(SshChannelError,
+        "ssh channel: extended dataType changed mid-stash")
+    if data.len > 0:
+      if c.pendingExt.len + data.len > MaxPendingSend:
+        raise newException(SshChannelError,
+          "ssh channel: send stash full, peer window shut")
+      let off = c.pendingExt.len
+      c.pendingExt.setLen(off + data.len)
+      copyMem(addr c.pendingExt[off], unsafeAddr data[0], data.len)
+    m.flushPending(c, id)
+    return data.len
+  c.pendingExtType = dataType
+  var first = 0
+  m.frameData(c, data, first, extended = true, dataType = dataType)
+  if first < data.len:
+    if data.len - first > MaxPendingSend:
+      raise newException(SshChannelError,
+        "ssh channel: send stash full, peer window shut")
+    c.pendingExt.setLen(data.len - first)
+    copyMem(addr c.pendingExt[0], unsafeAddr data[first],
+      data.len - first)
   m.channels[id] = c
-  result = off
+  result = data.len
 
 proc sendEof*(m: var ChannelMux, id: uint32) =
+  ## Best-effort flush of stashed bytes first (EOF must not overtake
+  ## data). Bulk senders: drain via cevWindowAdjust pacing, then EOF.
   var c = m.get(id)
   if c.eofSent:
     return
+  m.flushPending(c, id)
+  c = m.get(id)
   var w = initWriter()
   w.writeByte(MsgChannelEof)
   w.writeUint32(c.remoteId)
@@ -254,6 +350,8 @@ proc sendClose*(m: var ChannelMux, id: uint32) =
   m.outbox.add(w.toBytes())
   c.closeSent = true
   c.state = chClosed
+  c.pendingSend.setLen(0) # undeliverable now; free the memory
+  c.pendingExt.setLen(0)
   m.channels[id] = c
 
 proc maybeReap(m: var ChannelMux, id: uint32) =
@@ -353,6 +451,11 @@ proc feedInner(m: var ChannelMux, payload: openArray[byte],
     var c = m.get(recipient)
     c.remoteWindow += inc
     m.channels[recipient] = c
+    # Stashed bytes (if any) frame now; bulk senders learn the window
+    # reopened so they can pace instead of filling the stash.
+    m.flushPending(c, recipient)
+    result.add(ChanEvent(kind: cevWindowAdjust, localId: recipient,
+      status: inc))
   of MsgChannelData:
     let recipient = r.readUint32()
     let data = r.readString()
@@ -368,6 +471,10 @@ proc feedInner(m: var ChannelMux, payload: openArray[byte],
     w.writeUint32(c.remoteId)
     w.writeUint32(uint32(data.len))
     m.outbox.add(w.toBytes())
+    # Consumed immediately: re-grant what we took so streams wider
+    # than one window keep flowing (bounded: one in-flight window).
+    c.localWindow += uint32(data.len)
+    m.channels[recipient] = c
     result.add(ChanEvent(kind: cevData, localId: recipient, data: data))
   of MsgChannelExtendedData:
     let recipient = r.readUint32()
@@ -385,6 +492,8 @@ proc feedInner(m: var ChannelMux, payload: openArray[byte],
     w.writeUint32(c.remoteId)
     w.writeUint32(uint32(data.len))
     m.outbox.add(w.toBytes())
+    c.localWindow += uint32(data.len) # re-grant: consumed immediately
+    m.channels[recipient] = c
     result.add(ChanEvent(kind: cevExtendedData, localId: recipient,
                          dataType: dt, data: data))
   of MsgChannelEof:

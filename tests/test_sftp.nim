@@ -310,3 +310,175 @@ test "denyTypes rejects listed requests":
   check readStatus(decode(s.takeSftpOutbox()[0])) == FxOpUnsupported
   check fileExists(root / "x.txt")
   removeDir(root)
+
+template expectFx(want: uint32, body: untyped) =
+  ## Assert a backend op raises SftpError with the given status code.
+  try:
+    body
+    check false
+  except SftpError as e:
+    check e.code == want
+
+test "NUL and empty paths rejected":
+  let root = tmpRoot()
+  let b = newOsBackend(root)
+  expectFx FxFailure:
+    discard b.stat("")
+  expectFx FxFailure:
+    discard b.stat("/a\0b")
+  expectFx FxFailure:
+    discard b.openFile("", OpenRead, noAttrs())
+  removeDir(root)
+
+test "startDir enforced for relative paths":
+  let root = tmpRoot()
+  createDir(root / "sub")
+  let b = newOsBackend(root, 0o022'u32, "/sub")
+  # relative open lands under root/sub
+  let h = b.openFile("rel.txt", OpenWrite or OpenCreat or OpenTrunc,
+    noAttrs())
+  b.close(h)
+  check fileExists(root / "sub" / "rel.txt")
+  check not fileExists(root / "rel.txt")
+  # absolute paths still resolve against the root itself
+  let h2 = b.openFile("/top.txt", OpenWrite or OpenCreat or OpenTrunc,
+    noAttrs())
+  b.close(h2)
+  check fileExists(root / "top.txt")
+  # relative realpath reports the startDir-anchored location
+  check b.realpath("rel.txt") == "/sub/rel.txt"
+  # relative .. cannot leave the root either
+  expectFx FxPermissionDenied:
+    discard b.stat("../../elsewhere")
+  removeDir(root)
+
+test "escaping startDir fails fast at construction":
+  let root = tmpRoot()
+  expectFx FxPermissionDenied:
+    discard newOsBackend(root, 0o022'u32, "/../..")
+  expectFx FxPermissionDenied:
+    discard newOsBackend(root, 0o022'u32, "sub/../../..")
+  # a start dir that stays inside is fine, even nested with dots
+  let b = newOsBackend(root, 0o022'u32, "/a/../sub")
+  check b.startDir == normalizedPath(root / "sub")
+  removeDir(root)
+
+when defined(posix):
+  test "symlink escape confined: outside links are unreachable":
+    let root = tmpRoot()
+    let outside = root & "-outside"
+    createDir(outside)
+    writeFile(outside / "secret.txt", "top-secret")
+    writeFile(root / "real.txt", "inside")
+    let b = newOsBackend(root)
+    # absolute-outside target allowed at creation (OpenSSH-like)...
+    b.symlink("/link", outside / "secret.txt")
+    # ...but every following op lands on the re-rooted target and fails
+    expectFx FxNoSuchFile:
+      discard b.openFile("/link", OpenRead, noAttrs())
+    expectFx FxNoSuchFile:
+      discard b.openFile("/link", OpenWrite, noAttrs())
+    expectFx FxNoSuchFile:
+      discard b.stat("/link")
+    expectFx FxNoSuchFile:
+      discard b.opendir("/linkdir")
+    # the link itself is addressable: lstat sees a link, readlink is raw
+    let la = b.lstat("/link")
+    check (la.permissions and 0o170000'u32) == 0o120000'u32
+    check b.readlink("/link") == outside / "secret.txt"
+    # remove takes the link, not the target
+    b.symlink("/doomed", outside / "secret.txt")
+    b.remove("/doomed")
+    check not fileExists(root / "doomed")
+    check not symlinkExists(root / "doomed")
+    # ...and the outside file is untouched by everything above
+    check readFile(outside / "secret.txt") == "top-secret"
+    removeDir(root)
+    removeDir(outside)
+
+  test "symlink to inside file keeps working":
+    let root = tmpRoot()
+    writeFile(root / "real.txt", "inside-data")
+    let b = newOsBackend(root)
+    b.symlink("/ok", "/real.txt") # absolute-inside, re-rooted to itself
+    let h = b.openFile("/ok", OpenRead, noAttrs())
+    check b.read(h, 0, 64) == @[byte('i'), byte('n'), byte('s'),
+      byte('i'), byte('d'), byte('e'), byte('-'), byte('d'),
+      byte('a'), byte('t'), byte('a')]
+    b.close(h)
+    createDir(root / "d")
+    writeFile(root / "d" / "f.txt", "f")
+    b.symlink("/ddir", "/d")
+    let dh = b.opendir("/ddir")
+    var names: seq[string] = @[]
+    try:
+      while true:
+        for n in b.readdir(dh):
+          names.add(n.filename)
+    except SftpError as e:
+      check e.code == FxEof
+    check "f.txt" in names
+    removeDir(root)
+
+  test "opendir through outside dir-link denied":
+    let root = tmpRoot()
+    let outside = root & "-outside"
+    createDir(outside)
+    createDir(outside / "odir")
+    writeFile(outside / "odir" / "x.txt", "x")
+    let b = newOsBackend(root)
+    b.symlink("/odirlink", outside / "odir")
+    expectFx FxNoSuchFile:
+      discard b.opendir("/odirlink")
+    # relative link targets resolve against the link's dir
+    writeFile(root / "sib.txt", "sib")
+    b.symlink("/up", "../sib-outside") # resolves outside: denied
+    expectFx FxPermissionDenied:
+      discard b.stat("/up")
+    removeDir(root)
+    removeDir(outside)
+
+  test "readdir lists links as links (no target leak)":
+    let root = tmpRoot()
+    let outside = root & "-outside"
+    createDir(outside)
+    writeFile(outside / "secret.txt", "s")
+    writeFile(root / "plain.txt", "p")
+    let b = newOsBackend(root)
+    b.symlink("/link", outside / "secret.txt")
+    let dh = b.opendir("/")
+    var gotLink = false
+    var gotPlain = false
+    try:
+      while true:
+        for n in b.readdir(dh):
+          if n.filename == "link":
+            gotLink = true
+            check (n.attrs.permissions and 0o170000'u32) == 0o120000'u32
+          if n.filename == "plain.txt":
+            gotPlain = true
+            check (n.attrs.permissions and 0o170000'u32) == 0o100000'u32
+    except SftpError as e:
+      check e.code == FxEof
+    check gotLink
+    check gotPlain
+    removeDir(root)
+    removeDir(outside)
+
+  test "rename moves the link itself, target untouched":
+    let root = tmpRoot()
+    let outside = root & "-outside"
+    createDir(outside)
+    writeFile(outside / "secret.txt", "s")
+    let b = newOsBackend(root)
+    b.symlink("/a", outside / "secret.txt")
+    b.rename("/a", "/b")
+    check symlinkExists(root / "b")
+    check not symlinkExists(root / "a")
+    check readFile(outside / "secret.txt") == "s"
+    # dangling links rename too (kernel semantics)
+    b.symlink("/d1", "/nope-target")
+    b.rename("/d1", "/d2")
+    check symlinkExists(root / "d2")
+    removeDir(root)
+    removeDir(outside)

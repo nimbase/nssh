@@ -238,24 +238,54 @@ type
 
   OsBackend* = ref object of SftpBackend
     ## Serves `root` from the local disk. Client-visible `/` maps to
-    ## root; escapes are rejected with FxPermissionDenied.
+    ## root; relative client paths resolve against root/startDir.
+    ## Lexical escapes are rejected, and symlink *following* is
+    ## confined to the root (see resolveConfined). Symlink *targets*
+    ## are unrestricted at creation; readlink reports them raw.
     root*: string
+    startDir*: string ## disk path of the start dir (inside root)
     umask*: uint32
     nextId*: int
     files*: Table[string, OpenFile]
     dirs*: Table[string, OpenDir]
 
-proc newOsBackend*(root: string, umask = 0o022'u32): OsBackend =
-  result = OsBackend(root: root.absolutePath().normalizedPath(), umask: umask,
+proc newOsBackend*(root: string, umask = 0o022'u32,
+    startDir = "/"): OsBackend =
+  ## `startDir` is client-visible (`/` = root, the default). It is
+  ## normalized and must stay inside the root, else this raises
+  ## SftpError (fail fast, before serving anything).
+  let r = root.absolutePath().normalizedPath()
+  var sd = startDir
+  if sd.startsWith("/"):
+    sd = sd[1 ..^ 1]
+  let sdisk = normalizedPath(r / sd)
+  if sdisk != r and not sdisk.startsWith(r & DirSep):
+    var e = newException(SftpError,
+      "sftp backend: start dir escapes root: " & startDir)
+    e.code = FxPermissionDenied
+    raise e
+  result = OsBackend(root: r, startDir: sdisk, umask: umask,
     files: initTable[string, OpenFile](),
     dirs: initTable[string, OpenDir]())
 
 proc resolvePath(b: OsBackend, path: string): string =
-  ## Map a client path to disk, rejecting escapes.
+  ## Map a client path to disk, rejecting lexical escapes. Absolute
+  ## paths resolve against the root; relative paths against
+  ## root/startDir. This is lexical only: it does not resolve
+  ## symlinks, so every materializing op must go through
+  ## resolveConfined instead.
+  if path.len == 0:
+    raise sftpError(FxFailure, "empty path")
+  if '\0' in path:
+    raise sftpError(FxFailure, "NUL byte in path")
   var rel = path
-  if rel.startsWith("/"):
-    rel = rel[1 ..^ 1]
-  let full = normalizedPath(b.root / rel)
+  let base =
+    if rel.startsWith("/"):
+      rel = rel[1 ..^ 1]
+      b.root
+    else:
+      b.startDir
+  let full = normalizedPath(base / rel)
   if full != b.root and not full.startsWith(b.root & DirSep):
     raise sftpError(FxPermissionDenied, "path escapes root: " & path)
   result = full
@@ -266,11 +296,98 @@ proc clientPath(b: OsBackend, full: string): string =
     return "/"
   result = "/" & full.relativePath(b.root).replace(DirSep, '/')
 
+const MaxSymlinkDepth = 40 ## match SYMLOOP_MAX-style loop protection
+
+when defined(posix):
+  proc readLinkRaw(path: string): string =
+    ## Single-level readlink (no recursion; the walker re-enters).
+    ## Qualified: our SftpBackend.readlink method shadows posix.readlink.
+    var buf = newString(256)
+    while true:
+      let n = posix.readlink(path.cstring, cast[cstring](addr buf[0]),
+        buf.len)
+      if n < 0:
+        raise sftpError(FxFailure, "readlink failed: " & path)
+      if n < buf.len:
+        buf.setLen(n)
+        return buf
+      buf.setLen(buf.len * 2)
+
+proc resolveConfined(b: OsBackend, path: string,
+    followFinal = true): string =
+  ## resolvePath plus jailed symlink following. Walk components from
+  ## the root; every symlink met is resolved and containment is
+  ## re-verified at each step, with absolute targets re-rooted
+  ## (chroot semantics: `/link -> /etc/x` stays inside). Loops fail
+  ## fast. `followFinal = false` leaves a trailing link unresolved
+  ## (for lstat, readlink, and link creation/removal/renaming, which
+  ## must address the link itself). Non-existent tails stay lexical
+  ## under the last verified dir (creat case).
+  ##
+  ## Known limitation: check-then-use TOCTOU (a swapped component
+  ## between resolve and open). Same class as OpenSSH without chroot;
+  ## closing it needs openat2(RESOLVE_BENEATH), Linux-only.
+  let base = b.resolvePath(path)
+  when not defined(posix):
+    return base # no lstat: lexical check is all we have
+  if base == b.root:
+    return base
+  var parts = base.substr(b.root.len + 1).split(DirSep)
+  var cur = b.root
+  var depth = 0
+  var i = 0
+  while i < parts.len:
+    let comp = parts[i]
+    if comp.len == 0 or comp == ".":
+      inc i
+      continue
+    if comp == "..":
+      if cur == b.root:
+        raise sftpError(FxPermissionDenied, "path escapes root: " & path)
+      cur = parentDir(cur)
+      inc i
+      continue
+    let isLast = i == parts.len - 1
+    cur = cur / comp
+    var st: Stat
+    if lstat(cur.cstring, st) != 0:
+      # Tail does not exist: the verified parent plus the remaining
+      # lexical components (no ".." can appear: base is normalized)
+      # stays inside by construction.
+      var tail = parentDir(cur)
+      for j in i ..< parts.len:
+        if parts[j] == ".." or '\0' in parts[j]:
+          raise sftpError(FxPermissionDenied, "path escapes root: " & path)
+        tail = tail / parts[j]
+      return normalizedPath(tail)
+    if S_ISLNK(st.st_mode) and (not isLast or followFinal):
+      depth += 1
+      if depth > MaxSymlinkDepth:
+        raise sftpError(FxFailure,
+          "too many levels of symbolic links: " & path)
+      let target = readLinkRaw(cur)
+      var rest: seq[string] = @[]
+      if i + 1 < parts.len:
+        rest = parts[i + 1 ..^ 1]
+      if target.len > 0 and target[0] == '/':
+        cur = b.root # absolute target: re-root (chroot semantics)
+        parts = target[1 ..^ 1].split(DirSep) & rest
+      else:
+        cur = parentDir(cur)
+        parts = target.split(DirSep) & rest
+      i = 0
+      continue
+    inc i
+  result = cur
+
 proc allocHandle(b: OsBackend, prefix: string): string =
   inc b.nextId
   result = prefix & $b.nextId
 
-proc fileAttrs(full: string): SftpAttrs =
+proc fileAttrs(full: string, follow = true): SftpAttrs =
+  ## Attrs for a disk path. `follow = false` stats the link itself
+  ## (used for directory listings so entries can't leak outside
+  ## metadata through links).
   var uid = 0'u32
   var gid = 0'u32
   var perms = 0o644'u32
@@ -279,7 +396,10 @@ proc fileAttrs(full: string): SftpAttrs =
   var mtime = 0'u32
   when defined(posix):
     var st: Stat
-    if stat(full.cstring, st) == 0:
+    let ok =
+      if follow: stat(full.cstring, st) == 0
+      else: lstat(full.cstring, st) == 0
+    if ok:
       uid = uint32(st.st_uid)
       gid = uint32(st.st_gid)
       # Full st_mode including the S_IFMT file-type bits: OpenSSH
@@ -310,7 +430,9 @@ proc applyUmask(perms, umask: uint32): uint32 =
 
 method openFile*(b: OsBackend, path: string, pflags: uint32,
     attrs: SftpAttrs): string =
-  let full = b.resolvePath(path)
+  # Confined: following a link lands on a jailed target, so the
+  # opened fd can never point outside the root.
+  let full = b.resolveConfined(path)
   let wantRead = (pflags and OpenRead) != 0
   let wantWrite = (pflags and OpenWrite) != 0
   let wantAppend = (pflags and OpenAppend) != 0
@@ -398,13 +520,15 @@ method write*(b: OsBackend, handle: string, offset: uint64,
     pos += n
 
 method stat*(b: OsBackend, path: string): SftpAttrs =
-  let full = b.resolvePath(path)
+  let full = b.resolveConfined(path)
   if not fileExists(full) and not dirExists(full):
     raise sftpError(FxNoSuchFile, "no such file: " & path)
   result = fileAttrs(full)
 
 method lstat*(b: OsBackend, path: string): SftpAttrs =
-  let full = b.resolvePath(path)
+  # The link itself: confine intermediate components, leave the
+  # trailing link unresolved.
+  let full = b.resolveConfined(path, followFinal = false)
   when defined(posix):
     var st: Stat
     if lstat(full.cstring, st) != 0:
@@ -460,7 +584,8 @@ proc applySetstat(full: string, attrs: SftpAttrs) =
       raise sftpError(FxOpUnsupported, "chown not supported")
 
 method setstat*(b: OsBackend, path: string, attrs: SftpAttrs) =
-  let full = b.resolvePath(path)
+  # SETSTAT follows links (chmod-like); confinement keeps it inside.
+  let full = b.resolveConfined(path)
   if not fileExists(full) and not dirExists(full):
     raise sftpError(FxNoSuchFile, "no such file: " & path)
   applySetstat(full, attrs)
@@ -471,7 +596,7 @@ method fsetstat*(b: OsBackend, handle: string, attrs: SftpAttrs) =
   applySetstat(b.files[handle].path, attrs)
 
 method opendir*(b: OsBackend, path: string): string =
-  let full = b.resolvePath(path)
+  let full = b.resolveConfined(path)
   if not dirExists(full):
     raise sftpError(FxNoSuchFile, "no such directory: " & path)
   var entries: seq[string] = @[]
@@ -496,7 +621,7 @@ method readdir*(b: OsBackend, handle: string): seq[SftpName] =
     let full = d.path / name
     let a =
       try:
-        fileAttrs(full)
+        fileAttrs(full, follow = false) # links listed as links
       except CatchableError:
         continue
     result.add(SftpName(filename: name, longname: formatLongname(name, a),
@@ -506,7 +631,8 @@ method readdir*(b: OsBackend, handle: string): seq[SftpName] =
     raise sftpError(FxEof, "end of directory")
 
 method remove*(b: OsBackend, path: string) =
-  let full = b.resolvePath(path)
+  # removeFile takes the link itself, so address it unresolved.
+  let full = b.resolveConfined(path, followFinal = false)
   if not fileExists(full):
     raise sftpError(FxNoSuchFile, "no such file: " & path)
   try:
@@ -515,7 +641,8 @@ method remove*(b: OsBackend, path: string) =
     raise sftpError(FxPermissionDenied, "remove failed: " & e.msg)
 
 method mkdir*(b: OsBackend, path: string, attrs: SftpAttrs) =
-  let full = b.resolvePath(path)
+  # mkdir takes the path itself (EEXIST on a link); no following.
+  let full = b.resolveConfined(path, followFinal = false)
   if fileExists(full) or dirExists(full):
     raise sftpError(FxFailure, "path exists: " & path)
   try:
@@ -529,7 +656,7 @@ method mkdir*(b: OsBackend, path: string, attrs: SftpAttrs) =
     discard chmod(full.cstring, Mode(perms))
 
 method rmdir*(b: OsBackend, path: string) =
-  let full = b.resolvePath(path)
+  let full = b.resolveConfined(path, followFinal = false)
   if not dirExists(full):
     raise sftpError(FxNoSuchFile, "no such directory: " & path)
   try:
@@ -538,13 +665,17 @@ method rmdir*(b: OsBackend, path: string) =
     raise sftpError(FxPermissionDenied, "rmdir failed: " & e.msg)
 
 method realpath*(b: OsBackend, path: string): string =
-  let full = b.resolvePath(path)
+  # Canonicalize through links (spec behavior), still client-visible:
+  # confined targets always map back inside the root.
+  let full = b.resolveConfined(path)
   result = b.clientPath(full)
 
 method rename*(b: OsBackend, oldpath, newpath: string) =
-  let src = b.resolvePath(oldpath)
-  let dst = b.resolvePath(newpath)
-  if not fileExists(src) and not dirExists(src):
+  # rename moves links themselves; address both ends unresolved.
+  # symlinkExists covers dangling links, which rename must accept.
+  let src = b.resolveConfined(oldpath, followFinal = false)
+  let dst = b.resolveConfined(newpath, followFinal = false)
+  if not fileExists(src) and not dirExists(src) and not symlinkExists(src):
     raise sftpError(FxNoSuchFile, "no such file: " & oldpath)
   try:
     createDir(dst.parentDir)
@@ -553,14 +684,18 @@ method rename*(b: OsBackend, oldpath, newpath: string) =
     raise sftpError(FxPermissionDenied, "rename failed: " & e.msg)
 
 method readlink*(b: OsBackend, path: string): string =
-  let full = b.resolvePath(path)
+  # Address the link itself; the raw target is reported as-is
+  # (spec-correct). Following it elsewhere stays jailed.
+  let full = b.resolveConfined(path, followFinal = false)
   try:
     result = expandSymlink(full)
   except CatchableError as e:
     raise sftpError(FxNoSuchFile, "readlink failed: " & e.msg)
 
 method symlink*(b: OsBackend, linkpath, targetpath: string) =
-  let full = b.resolvePath(linkpath)
+  # The link itself must live inside; the target is unrestricted
+  # (following it is what stays jailed).
+  let full = b.resolveConfined(linkpath, followFinal = false)
   try:
     createDir(full.parentDir)
     createSymlink(targetpath, full)
@@ -899,6 +1034,12 @@ proc sftpFeed*(s: var SftpServer, data: openArray[byte]) =
     if s.buf.len < int(4 + pktLen):
       return
     let typ = s.buf[4]
-    let body = s.buf[5 ..< 4 + int(pktLen)]
-    s.buf = s.buf[4 + int(pktLen) ..^ 1]
-    s.dispatch(typ, body)
+    # Dispatch from a view (no copy), then consume in place: shift the
+    # remainder down and keep capacity, so a long session of small
+    # packets reuses one buffer instead of reallocating per packet.
+    let total = 4 + int(pktLen)
+    s.dispatch(typ, s.buf.toOpenArray(5, total - 1))
+    let left = s.buf.len - total
+    if left > 0:
+      copyMem(addr s.buf[0], addr s.buf[total], left)
+    s.buf.setLen(left)

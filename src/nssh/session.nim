@@ -371,24 +371,31 @@ proc sendPayloadInner(s: var SshSession, payload: openArray[byte]) =
     s.outbox.add(wire)
   elif activeCipher == ckAes128Ctr or activeCipher == ckAes256Ctr:
     if isEtm(s.keys.toPeer.mac):
-      let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
-      let ctRest = s.keys.toPeer.cipher.ctrCrypt(enc.toOpenArray(4, enc.high))
-      var wire = newSeq[byte](4 + ctRest.len)
-      copyMem(addr wire[0], unsafeAddr enc[0], 4)
-      copyMem(addr wire[4], unsafeAddr ctRest[0], ctRest.len)
+      # Single buffer: encode, encrypt the body in place, MAC the
+      # ciphertext, append the tag. (ETM MAC covers ciphertext.)
+      var wire = encodePacket(payload, spec.blockSize, lengthInClear = true)
+      s.keys.toPeer.cipher.ctrCryptInPlace(wire.toOpenArray(4, wire.high))
       let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
         wire.toOpenArray(0, wire.high))
-      let full = wire & m
-      s.bytesSent += uint64(full.len)
-      s.outbox.add(full)
+      let off = wire.len
+      wire.setLen(off + m.len)
+      if m.len > 0:
+        copyMem(addr wire[off], unsafeAddr m[0], m.len)
+      s.bytesSent += uint64(wire.len)
+      s.outbox.add(wire)
     else:
-      let enc = encodePacket(payload, spec.blockSize)
-      let ct = s.keys.toPeer.cipher.ctrCrypt(enc)
+      # Single buffer: encode, MAC the plaintext FIRST, then encrypt in
+      # place (non-ETM MAC covers the unencrypted packet), append tag.
+      var wire = encodePacket(payload, spec.blockSize)
       let m = computeMac(s.keys.toPeer.mac, s.keys.toPeer.macKey, s.sendSeq,
-        enc.toOpenArray(0, enc.high))
-      let full = ct & m
-      s.bytesSent += uint64(full.len)
-      s.outbox.add(full)
+        wire.toOpenArray(0, wire.high))
+      s.keys.toPeer.cipher.ctrCryptInPlace(wire.toOpenArray(0, wire.high))
+      let off = wire.len
+      wire.setLen(off + m.len)
+      if m.len > 0:
+        copyMem(addr wire[off], unsafeAddr m[0], m.len)
+      s.bytesSent += uint64(wire.len)
+      s.outbox.add(wire)
   elif activeCipher == ckAes128Gcm or activeCipher == ckAes256Gcm:
     let enc = encodePacket(payload, spec.blockSize, lengthInClear = true)
     var plen: array[4, byte]
@@ -602,11 +609,11 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
       s.inBuf.toOpenArray(total - macL, total - 1))
     if not ok:
       raise newException(SshSessionError, "ssh session: MAC verification failed")
-    let dec = s.keys.fromPeer.cipher.ctrCrypt(s.inBuf.toOpenArray(4, total - macL - 1))
-    var full = newSeq[byte](4 + dec.len)
-    copyMem(addr full[0], addr s.inBuf[0], 4)
-    copyMem(addr full[4], unsafeAddr dec[0], dec.len)
-    let payload = payloadOf(full)
+    # Verified: decrypt the body in place (length stays clear for ETM)
+    # instead of allocating a second packet buffer.
+    s.keys.fromPeer.cipher.ctrCryptInPlace(
+      s.inBuf.toOpenArray(4, total - macL - 1))
+    let payload = payloadOf(s.inBuf.toOpenArray(0, total - macL - 1))
     s.consume(total)
     s.bumpRecvSeq()
     return (true, payload)
@@ -626,18 +633,31 @@ proc pullCtrOne(s: var SshSession): tuple[found: bool, payload: seq[byte]] =
   let total = 4 + int(packetLen) + macL
   if s.inBuf.len < total:
     return (false, @[])
-  let enc = s.keys.fromPeer.cipher.ctrCrypt(s.inBuf.toOpenArray(0, total - macL - 1))
-  let ok =
-    if isEtm(s.keys.fromPeer.mac):
-      verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
-        s.inBuf.toOpenArray(0, total - macL - 1),
-        s.inBuf.toOpenArray(total - macL, total - 1))
-    else:
-      verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq, enc,
-        s.inBuf.toOpenArray(total - macL, total - 1))
+  # ETM-flavored MAC input is the ciphertext; plain MAC input is the
+  # plaintext. Decrypt in place only after a ciphertext-side verify,
+  # or when the verify itself needs the plaintext (failure is fatal
+  # either way, so mutating first is safe there too).
+  if isEtm(s.keys.fromPeer.mac):
+    let ok = verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
+      s.inBuf.toOpenArray(0, total - macL - 1),
+      s.inBuf.toOpenArray(total - macL, total - 1))
+    if not ok:
+      raise newException(SshSessionError, "ssh session: MAC verification failed")
+    s.keys.fromPeer.cipher.ctrCryptInPlace(
+      s.inBuf.toOpenArray(0, total - macL - 1))
+    let payload = payloadOf(s.inBuf.toOpenArray(0, total - macL - 1))
+    s.consume(total)
+    s.bumpRecvSeq()
+    result = (true, payload)
+    return
+  s.keys.fromPeer.cipher.ctrCryptInPlace(
+    s.inBuf.toOpenArray(0, total - macL - 1))
+  let ok = verifyMac(s.keys.fromPeer.mac, s.keys.fromPeer.macKey, s.recvSeq,
+    s.inBuf.toOpenArray(0, total - macL - 1),
+    s.inBuf.toOpenArray(total - macL, total - 1))
   if not ok:
     raise newException(SshSessionError, "ssh session: MAC verification failed")
-  let payload = payloadOf(enc)
+  let payload = payloadOf(s.inBuf.toOpenArray(0, total - macL - 1))
   s.consume(total)
   s.bumpRecvSeq()
   result = (true, payload)
