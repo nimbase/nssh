@@ -42,28 +42,18 @@ Unknown message types get proper `UNIMPLEMENTED` replies.
 
 ## Supported algorithms
 
-| Area | Supported |
-|---------|-----------|
-| Key exchange | `curve25519-sha256`, `diffie-hellman-group14-sha256` |
-| Host keys | `ssh-ed25519` |
-| Ciphers | `chacha20-poly1305@openssh.com`, `aes128-ctr`, `aes256-ctr`, `aes128-gcm@openssh.com`, `aes256-gcm@openssh.com` |
-| MACs | `hmac-sha2-256`, `hmac-sha2-512`, ETM variants of both (CTR ciphers; AEAD ciphers need no separate MAC) |
-| Auth | `none`, `publickey` (`ssh-ed25519`), `password` |
-| Channels | `session` with `exec`, `shell`, `env`, `pty-req`, `window-change`, `signal`, `subsystem`, data, EOF/close, `exit-status`/`exit-signal` |
-| SFTP | server, protocol v3 (the version OpenSSH speaks); no client yet |
-| Compression | `none` |
+- Key exchange: `curve25519-sha256`, `diffie-hellman-group14-sha256`
+- Host keys: `ssh-ed25519`
+- Ciphers: `chacha20-poly1305@openssh.com`, `aes128-ctr`, `aes256-ctr`, `aes128-gcm@openssh.com`, `aes256-gcm@openssh.com`
+- MACs: `hmac-sha2-256`, `hmac-sha2-512`, ETM variants of both (CTR ciphers; AEAD ciphers need no separate MAC)
+- Auth: `none`, `publickey` (`ssh-ed25519`), `password`
+- Channels: `session` with `exec`, `shell`, `env`, `pty-req`, `window-change`, `signal`, `subsystem`, data, EOF/close, `exit-status`/`exit-signal`
+- SFTP: server, protocol v3 (the version OpenSSH speaks); no client yet
+- Compression: `none`
 
 Deliberately missing: legacy ciphers and MACs, RSA/ECDSA host keys,
 `keyboard-interactive` auth, forwarding. Modern-only is a design
 choice, not a gap.
-
-## Install
-
-Requires Nim >= 2.2.10 (see `nssh.nimble` for the rest):
-
-```sh
-nimble install nssh
-```
 
 ## Examples
 
@@ -197,24 +187,201 @@ let rules = @[
     umask: 0o002'u32, startDir: "/"),
 ]
 # Prefer real accounts? Use systemIdentity(user) as the resolver.
-
-# Sketch of the per-connection wiring (full pump lives in
-# examples/sftp_loopback.nim). After AuthServer reports success as `user`:
-#   on cevSubsystem("sftp"):
-#     try:
-#       app.sftp = serverFor(matchRule(rules, resolver(user)))
-#       app.mux.replyChannelRequest(ev.localId, true)
-#     except SftpError:
-#       app.mux.replyChannelRequest(ev.localId, false)
-#   on cevData: app.sftp.sftpFeed(ev.data)
-#     then sendData each packet from app.sftp.takeSftpOutbox()
-#   on cevEof: sendEof + sendClose (see below)
 ```
 
-Want a different filesystem? Implement the `SftpBackend` methods and
-pass it to `initSftpServer`. The bundled `OsBackend` serves a local
-folder (escapes rejected), `ReadOnlyBackend` wraps any backend, and
-`denyTypes` blocks specific requests (the `sftp-server -P` equivalent).
+How the pieces fit on each connection: `AuthServer` tells you the
+username once authentication succeeds. Turn it into an identity with
+the resolver (groups included), run it through the rules, and build
+a server for the winner with `serverFor`. Anything else, unknown
+users and non-sftp subsystems alike, gets a decline. Channel data
+then flows through `sftpFeed`, with every response packet sent back
+via `sendData`. EOF closes the channel with `sendEof` plus
+`sendClose`, as always.
+
+```nim
+import std/tables
+import nssh/server
+import nssh/auth
+import nssh/channel
+import nssh/hostkeys
+import nssh/sftp
+import nssh/sftp_match
+
+let resolver = newStaticResolver([
+  ("alice", Identity(user: "alice", groups: @["dev"],
+                      home: "/home/alice")),
+  ("bob", Identity(user: "bob", groups: @["ro"],
+                    home: "/home/bob")),
+])
+let rules = @[
+  MatchRule(users: @["bob"], root: "/srv/sftp/ro/%u", readOnly: true,
+    umask: 0o022'u32, startDir: "/"),
+  MatchRule(groups: @["dev"], root: "/srv/sftp/dev/%u",
+    umask: 0o002'u32, startDir: "/"),
+]
+
+type SftpApp = ref object
+  auth: AuthServer
+  mux: ChannelMux
+  user: string
+  authed: bool
+  sfx: SftpServer # valid once the subsystem is accepted
+  hasSftp: bool
+  sftpCh: uint32
+
+var apps = initTable[pointer, SftpApp]()
+let hk = generateEdKey()
+var srv: SshServer
+srv = newSshServer(hk, "127.0.0.1", 2222,
+  onReady = proc(c: ServerConn) =
+    apps[cast[pointer](c)] = SftpApp(
+      auth: initAuthServer(c.session.sessionId,
+        checkKey = proc(u, alg: string, blob: seq[byte]): bool {.closure.} =
+          true),
+      mux: initMux(true))
+  ,
+  onPacket = proc(c: ServerConn, m: byte, p: seq[byte], q: uint32) =
+    let app = apps.getOrDefault(cast[pointer](c))
+    if app == nil: return
+    if m < 80:
+      let ev = app.auth.authFeed(p, q)
+      if ev.kind == asSuccess:
+        app.user = ev.user
+        app.authed = true
+      for q2 in app.auth.takeOutbox():
+        srv.sendRaw(c, q2)
+    else:
+      for ev in app.mux.feed(p, q):
+        case ev.kind
+        of cevSubsystem:
+          if ev.text == "sftp" and app.authed:
+            try:
+              let ident = resolver(app.user)
+              app.sfx = serverFor(matchRule(rules, ident), ident)
+              app.hasSftp = true
+              app.sftpCh = ev.localId
+              app.mux.replyChannelRequest(ev.localId, true)
+            except SftpError:
+              app.mux.replyChannelRequest(ev.localId, false)
+          else:
+            app.mux.replyChannelRequest(ev.localId, false)
+        of cevData:
+          if app.hasSftp and ev.localId == app.sftpCh:
+            app.sfx.sftpFeed(ev.data)
+            for resp in app.sfx.takeSftpOutbox():
+              discard app.mux.sendData(app.sftpCh, resp)
+        of cevEof:
+          if app.hasSftp and ev.localId == app.sftpCh:
+            app.mux.sendEof(ev.localId)
+            app.mux.sendClose(ev.localId)
+        of cevClose:
+          app.hasSftp = false
+        else:
+          discard
+      for q2 in app.mux.takeOutbox():
+        srv.sendRaw(c, q2)
+  ,
+  onClose = proc(c: ServerConn) =
+    apps.del(cast[pointer](c))
+)
+srv.run()
+```
+
+### Serve a custom filesystem
+
+`SftpBackend` is a base type with one method per SFTP operation.
+Override the ones you need and pass the result to `initSftpServer`.
+Anything left out answers `OpUnsupported` on its own, and raising
+`SftpError` with an `SSH_FX_*` code becomes the client's status
+reply. A tiny in-memory read-only filesystem looks like this:
+
+```nim
+import std/tables
+import nssh/sftp
+
+type
+  MemBackend* = ref object of SftpBackend
+    files: Table[string, string] # client path -> content
+    openDirs: Table[string, seq[string]]
+
+proc memErr(code: uint32, msg: string): ref SftpError =
+  var e = newException(SftpError, msg)
+  e.code = code
+  e
+
+method openFile(b: MemBackend, path: string, pflags: uint32,
+    attrs: SftpAttrs): string =
+  if path notin b.files:
+    raise memErr(FxNoSuchFile, "no such file: " & path)
+  if (pflags and (OpenWrite or OpenAppend or OpenCreat or OpenTrunc or
+      OpenExcl)) != 0:
+    raise memErr(FxPermissionDenied, "read-only backend")
+  path # the path doubles as the open handle
+
+method close(b: MemBackend, handle: string) =
+  if handle in b.openDirs:
+    b.openDirs.del(handle)
+  elif handle notin b.files:
+    raise memErr(FxFailure, "unknown handle")
+
+method read(b: MemBackend, handle: string, offset: uint64,
+    len: uint32): seq[byte] =
+  if handle notin b.files:
+    raise memErr(FxFailure, "unknown handle")
+  let content = b.files[handle]
+  if offset >= uint64(content.len):
+    raise memErr(FxEof, "end of file")
+  let n = min(uint64(len), uint64(content.len) - offset)
+  result = newSeq[byte](n)
+  for i in 0 ..< int(n):
+    result[i] = byte(content[int(offset) + i])
+
+method stat(b: MemBackend, path: string): SftpAttrs =
+  if path == "/":
+    return fullAttrs(0, 0, 0, 0o040755'u32, 0, 0)
+  if path notin b.files:
+    raise memErr(FxNoSuchFile, "no such file: " & path)
+  fullAttrs(uint64(b.files[path].len), 0, 0, 0o100644'u32, 0, 0)
+
+method lstat(b: MemBackend, path: string): SftpAttrs =
+  b.stat(path)
+
+method opendir(b: MemBackend, path: string): string =
+  if path != "/":
+    raise memErr(FxNoSuchFile, "no such directory: " & path)
+  result = "dir" & $b.openDirs.len
+  var names: seq[string] = @[]
+  for k in b.files.keys:
+    names.add(k[1 ..^ 1]) # strip the leading slash for display
+  b.openDirs[result] = names
+
+method readdir(b: MemBackend, handle: string): seq[SftpName] =
+  if handle notin b.openDirs:
+    raise memErr(FxFailure, "unknown handle")
+  let names = b.openDirs[handle]
+  b.openDirs.del(handle) # one-shot listing: the next call reports EOF
+  if names.len == 0:
+    raise memErr(FxEof, "empty directory")
+  for n in names:
+    let a = fullAttrs(uint64(b.files["/" & n].len), 0, 0,
+      0o100644'u32, 0, 0)
+    result.add(SftpName(filename: n, longname: formatLongname(n, a),
+      attrs: a))
+
+method realpath(b: MemBackend, path: string): string =
+  if path == "/" or path in b.files:
+    return path
+  raise memErr(FxNoSuchFile, "no such file: " & path)
+
+let mem = MemBackend(files: {"/hello.txt": "hi\n"}.toTable(),
+  openDirs: initTable[string, seq[string]]())
+var sfx = initSftpServer(mem)
+# then feed channel data: sfx.sftpFeed(data), sendData each response
+```
+
+The bundled `OsBackend` serves a local folder (escapes rejected),
+`ReadOnlyBackend` wraps any backend, and `denyTypes` blocks specific
+requests (the `sftp-server -P` equivalent).
 
 ### Two things that bite
 
@@ -241,23 +408,62 @@ gracefully when OpenSSH is missing. `examples/sftp_loopback.nim` and
 
 ## Roadmap
 
-**Shipped.** SSH transport, auth, and channels. Transparent rekeying,
-keepalive, known-hosts verification. SFTP v3 server with user/group
-Match rules. OpenSSH interop both ways.
+### Transport and crypto
 
-**Next.**
-- SFTP v4 to v6 plus OpenSSH extensions (`posix-rename`, `statvfs`,
-  `hardlink`, `fsync`, `lsetstat`, `limits`, `home-directory`)
-- Opt-in compression through nim-zlib (including delayed
-  `zlib@openssh.com`)
-- More key exchange methods and host key types as interop needs them
-- CI running the full suite, then a 0.2.0 release
+- [x] Binary packet protocol: version exchange, framing, padding, limits
+- [x] Key exchange: curve25519-sha256, diffie-hellman-group14-sha256
+- [x] Ciphers: chacha20-poly1305, AES-CTR (128/256), AES-GCM (128/256)
+- [x] MACs: hmac-sha2-256/512 plus ETM variants
+- [x] Host keys: ssh-ed25519 (generate, sign, verify, authorized_keys, fingerprints)
+- [x] Independent C2S/S2C cipher and MAC negotiation (RFC 4253 section 7.1)
+- [x] OpenSSH framing fixes: ETM clear-length CTR packets, GCM nonce from the full KEX IV
+- [ ] More key exchange: groups 15-18, DH-GEX, ecdh-nistp, strict-kex (Terrapin mitigation)
+- [ ] More host keys: ECDSA, RSA-SHA2
+- [ ] server-sig-algs extension
+- [ ] Opt-in compression through nim-zlib (including delayed zlib@openssh.com)
 
-**Later.**
-- TCP and agent forwarding
-- `keyboard-interactive` authentication
+### Session and auth
 
-Legacy algorithms stay out on purpose.
+- [x] Session state machine: handshake, NEWKEYS, encrypted transport, disconnect
+- [x] Auth methods none, publickey (ed25519), and password, client and server
+- [x] Known-hosts verification with strict and trust-on-first-use modes
+- [x] Transparent RFC 4253 rekeying with automatic triggers (1 GB / 1M packets / 3600 s)
+- [x] Opt-in keepalive IGNORE timer plus idle timeout
+- [x] Sequence numbers raise instead of wrapping
+- [ ] keyboard-interactive authentication
+- [ ] OpenSSH certificates
+
+### Channels
+
+- [x] Session channels: open, exec, shell, env, pty-req, data, EOF/close, exit status and exit signal
+- [x] window-change and signal events plus senders
+- [x] Explicit subsystem authorization (no auto-accept, the app replies)
+- [ ] TCP forwarding (direct-tcpip, forwarded-tcpip)
+- [ ] Agent forwarding
+
+### SFTP
+
+- [x] SFTP v3 server with the full file, dir, status, rename, and symlink op set
+- [x] Pluggable SftpBackend plus sandboxed OsBackend and ReadOnlyBackend
+- [x] User and group Match rules with root expansion, read-only flag, and umask
+- [x] ATTRS responses carry full st_mode type bits (OpenSSH interop fix)
+- [x] EOF half-close handshake answered (RFC 4254 section 5.3)
+- [ ] SFTP v4 to v6 as negotiated deltas
+- [ ] OpenSSH extensions: posix-rename, statvfs, hardlink, fsync, lsetstat, limits, home-directory
+
+### Wiring, tests, and releases
+
+- [x] Client and server with owned event loops (poll/run/close)
+- [x] Typed algorithm offers with forcing for constrained peers and tests
+- [x] 15 test suites covering handshake, ciphers, auth, channels, rekeying, keepalive, SFTP, and Match rules
+- [x] OpenSSH interop both ways: system ssh against our server, our client against sshd, system sftp against our server
+- [x] Offline loopback examples for exec and sftp (no sockets)
+- [x] README with working examples, CHANGELOG, LICENSE
+- [ ] Throughput benchmarks and a CTR/GCM performance pass
+- [ ] CI running the full suite
+- [ ] 0.2.0 release
+
+Legacy algorithms (CBC, 3DES, SHA-1 MACs) stay out on purpose.
 
 ### 🎩 License
 MIT license
