@@ -14,10 +14,15 @@
 
 
 > [!NOTE]
+<<<<<<< HEAD
 > Pure Nim SSH-2.0 with no C code and no OpenSSL. Async networking comes
 > from [`powpow`](https://github.com/openpeeps/powpow), crypto from
 > [`nimcypher`](https://github.com/nimbase/nimcypher). Modern algorithms
 > only. **Experimental software!**
+=======
+> This is a modern-only SSH-2.0 client and server in strict pure Nim (no C, no OpenSSL).
+> Async TCP comes from [`powpow`](https://github.com/openpeeps/powpow), crypto from [`nimcypher`](https://github.com/nimbase/nimcypher).
+>>>>>>> 9ece0fcb9bfc225871de06aadd4ade31fb613ea0
 
 ## What you get
 
