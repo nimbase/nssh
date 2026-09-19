@@ -47,10 +47,6 @@ Sequence numbers refuse to wrap instead of silently overflowing. Host
 keys verify against `known_hosts` (strict or trust-on-first-use).
 Unknown message types get proper `UNIMPLEMENTED` replies.
 
-
-## Key features
-- 
-
 ## Supported algorithms
 
 - Key exchange: `curve25519-sha256`, `diffie-hellman-group14-sha256`
@@ -68,7 +64,7 @@ choice, not a gap.
 
 ## Examples
 
-### Create an SSH server
+### The SSH server
 
 The skeleton every server builds on: generate a host key, create the
 server, track one state machine per connection, and drive the loop.
